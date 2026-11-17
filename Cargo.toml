@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "smoke-core",
+    "smoke-cli",
+]
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["full"] }
+socket2 = { version = "0.5", features = ["all"] }
+bytes = "1.7"
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hickory-resolver = { version = "0.24", features = ["tokio-runtime", "dns-over-https-rustls", "webpki-roots"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,11 @@
+[package]
+name = "smoke-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+smoke-core = { path = "../smoke-core" }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
