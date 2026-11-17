@@ -3,7 +3,7 @@ use tokio::io::{AsyncWriteExt, Result};
 use tokio::net::TcpStream;
 use tracing::debug;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SplitStrategy {
     /// Отправка без изменений
     None,
@@ -15,8 +15,14 @@ pub enum SplitStrategy {
     TlsRecordFragSni,
     /// 4. Disorder1: отправка 1-го байта с TTL=1 (умирает на 1-м узле), ретрансмит через SACK
     Disorder1,
+    /// 4b. Disorder2: отправка 1-го байта с TTL=2 (для роутеров и GPON-модемов)
+    Disorder2,
+    /// 4c. Disorder3: отправка 1-го байта с TTL=3 (для глубоких сетей)
+    Disorder3,
     /// 5. DisorderSni: отправка заголовка до середины SNI с TTL=1, ретрансмит через SACK
     DisorderSni,
+    /// 5b. DisorderSni2: отправка заголовка до середины SNI с TTL=2, ретрансмит через SACK
+    DisorderSni2,
     /// 6. OobSni: инъекция Out-of-band (TCP Urgent Pointer) байта в середину SNI
     OobSni,
     /// 7. TcpSplit1: чистый TCP-сплит после 1-го байта
@@ -94,11 +100,26 @@ pub async fn send_desync(
             send_disorder(remote, buf, 1, 1).await
         }
 
+        SplitStrategy::Disorder2 => {
+            send_disorder(remote, buf, 1, 2).await
+        }
+
+        SplitStrategy::Disorder3 => {
+            send_disorder(remote, buf, 1, 3).await
+        }
+
         SplitStrategy::DisorderSni => {
             let pos = find_sni_middle(buf)
                 .or_else(|| find_http_host_split(buf))
                 .unwrap_or(2.min(buf.len() - 1).max(1));
             send_disorder(remote, buf, pos, 1).await
+        }
+
+        SplitStrategy::DisorderSni2 => {
+            let pos = find_sni_middle(buf)
+                .or_else(|| find_http_host_split(buf))
+                .unwrap_or(2.min(buf.len() - 1).max(1));
+            send_disorder(remote, buf, pos, 2).await
         }
 
         SplitStrategy::OobSni => {

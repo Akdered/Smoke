@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "smoke",
     about = "Высокоскоростной DPI-bypass прокси для Windows",
-    version = "0.4.1"
+    version = "0.5.0"
 )]
 struct Args {
     /// Адрес и порт для запуска прокси
@@ -31,6 +31,14 @@ struct Args {
     /// Запустить предварительный бенчмарк сети перед стартом
     #[arg(long)]
     scan: bool,
+
+    /// Разрешить протокол QUIC (HTTP/3 UDP) в браузерах (по умолчанию заблокирован для быстрого 4K видео)
+    #[arg(long)]
+    allow_quic: bool,
+
+    /// Скрыть окно консоли и работать в фоновом режиме
+    #[arg(short, long)]
+    minimized: bool,
 
     /// Не включать системный прокси Windows (для ручной настройки в приложениях)
     #[arg(long)]
@@ -69,8 +77,14 @@ enum StrategyArg {
     TlsRecordFragSni,
     /// Трюк Disorder: 1-й байт с TTL=1, ретрансмит через SACK
     Disorder1,
+    /// Трюк Disorder: 1-й байт с TTL=2 (для роутеров и GPON-модемов)
+    Disorder2,
+    /// Трюк Disorder: 1-й байт с TTL=3 (для глубоких домашних сетей)
+    Disorder3,
     /// Трюк Disorder до середины SNI с TTL=1, ретрансмит через SACK
     DisorderSni,
+    /// Трюк Disorder до середины SNI с TTL=2, ретрансмит через SACK
+    DisorderSni2,
     /// Инъекция TCP Urgent Pointer (OOB) байта в середине SNI
     OobSni,
     /// Чистый TCP-сплит после 1-го байта
@@ -94,6 +108,10 @@ async fn main() -> Result<()> {
         sysproxy::disable_raw();
         println!("Системный прокси Windows отключен. Настройки сети сброшены.");
         return Ok(());
+    }
+
+    if args.minimized {
+        hide_console_window();
     }
 
     let default_filter = if args.verbose { "debug" } else { "info" };
@@ -121,7 +139,7 @@ async fn main() -> Result<()> {
  ___/ // / / / / // /_/ / / ,<  /  __/   
 /____//_/ /_/ /_/ \____/ /_/|_| \___/    
              by Akdered
-    High-Performance DPI Bypass Engine v0.4.1
+    High-Performance DPI Bypass Engine v0.5.0
 "#
     );
 
@@ -137,7 +155,10 @@ async fn main() -> Result<()> {
             StrategyArg::TlsRecordFrag2 => SplitStrategy::TlsRecordFrag2,
             StrategyArg::TlsRecordFragSni => SplitStrategy::TlsRecordFragSni,
             StrategyArg::Disorder1 => SplitStrategy::Disorder1,
+            StrategyArg::Disorder2 => SplitStrategy::Disorder2,
+            StrategyArg::Disorder3 => SplitStrategy::Disorder3,
             StrategyArg::DisorderSni => SplitStrategy::DisorderSni,
+            StrategyArg::DisorderSni2 => SplitStrategy::DisorderSni2,
             StrategyArg::OobSni => SplitStrategy::OobSni,
             StrategyArg::TcpSplit1 => SplitStrategy::TcpSplit1,
             StrategyArg::TcpSplit2 => SplitStrategy::TcpSplit2,
@@ -161,12 +182,12 @@ async fn main() -> Result<()> {
     if let Some(strat) = fixed_strategy {
         info!("Фиксированный режим десинхронизации: {:?}", strat);
     } else {
-        info!("Режим: Smart Adaptive Engine (10 техник обхода, самообучение на лету)");
+        info!("Режим: Smart Adaptive Engine (13 техник обхода, автосохранение на диск)");
     }
 
-    // Включаем системный прокси Windows
+    // Включаем системный прокси Windows и блокировку UDP QUIC
     let mut proxy_guard = if !args.no_sysproxy {
-        Some(sysproxy::ProxyGuard::enable(&args.bind)?)
+        Some(sysproxy::ProxyGuard::enable(&args.bind, !args.allow_quic)?)
     } else {
         info!("Системный прокси Windows отключен флагом --no-sysproxy");
         None
@@ -198,6 +219,29 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(target_os = "windows")]
+fn hide_console_window() {
+    #[link(name = "user32")]
+    extern "system" {
+        fn ShowWindow(hWnd: *mut core::ffi::c_void, nCmdShow: i32) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleWindow() -> *mut core::ffi::c_void;
+    }
+
+    const SW_HIDE: i32 = 0;
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        if !hwnd.is_null() {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_console_window() {}
 
 #[cfg(target_os = "windows")]
 fn setup_console_close_handler() {

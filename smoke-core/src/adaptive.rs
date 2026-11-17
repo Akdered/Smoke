@@ -1,5 +1,6 @@
 use crate::desync::SplitStrategy;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::RwLock;
 use tracing::{debug, info};
 
@@ -8,33 +9,38 @@ pub const DEFAULT_STRATEGIES: &[SplitStrategy] = &[
     SplitStrategy::TlsRecordFrag,
     SplitStrategy::TlsRecordFrag2,
     SplitStrategy::Disorder1,
+    SplitStrategy::Disorder2,
     SplitStrategy::TcpSplitSni,
     SplitStrategy::OobSni,
     SplitStrategy::TlsRecordFragSni,
     SplitStrategy::DisorderSni,
+    SplitStrategy::DisorderSni2,
     SplitStrategy::Combo,
+    SplitStrategy::Disorder3,
     SplitStrategy::TcpSplit2,
     SplitStrategy::TcpSplit1,
 ];
 
 /// Специализированный порядок стратегий для Discord (API, Gateway, CDN, Updates):
-/// По статистике Zapret/ByeDPI в РФ, Disorder1 (TTL=1 + SACK) пробивает блокировки Discord в 95%+ случаев!
+/// По статистике Zapret/ByeDPI в РФ, Disorder1 и Disorder2 пробивают блокировки Discord у подавляющего большинства провайдеров!
 pub const DISCORD_STRATEGIES: &[SplitStrategy] = &[
     SplitStrategy::Disorder1,
+    SplitStrategy::Disorder2,
     SplitStrategy::TlsRecordFrag2,
     SplitStrategy::TcpSplitSni,
     SplitStrategy::Combo,
     SplitStrategy::DisorderSni,
+    SplitStrategy::DisorderSni2,
     SplitStrategy::OobSni,
     SplitStrategy::TlsRecordFrag,
     SplitStrategy::TlsRecordFragSni,
+    SplitStrategy::Disorder3,
     SplitStrategy::TcpSplit2,
     SplitStrategy::TcpSplit1,
 ];
 
-/// Интеллектуальный самообучающийся движок:
-/// Автоматически подбирает и запоминает рабочие стратегии для каждого домена на лету.
-/// Если провайдер сбрасывает соединение — мгновенно переключается на следующую стратегию из арсенала.
+/// Интеллектуальный самообучающийся движок с автосохранением на диск:
+/// Автоматически подбирает, закрепляет и сохраняет рабочие стратегии для каждого семейства доменов.
 #[derive(Debug)]
 pub struct AdaptiveEngine {
     domain_cache: RwLock<HashMap<String, usize>>,
@@ -42,8 +48,9 @@ pub struct AdaptiveEngine {
 
 impl AdaptiveEngine {
     pub fn new() -> Self {
+        let initial_cache = load_cache_from_disk();
         Self {
-            domain_cache: RwLock::new(HashMap::new()),
+            domain_cache: RwLock::new(initial_cache),
         }
     }
 
@@ -69,7 +76,7 @@ impl AdaptiveEngine {
         strategies.get(idx).copied().unwrap_or(strategies[0])
     }
 
-    /// Закрепляет успешную стратегию при подтвержденном ответе от сервера
+    /// Закрепляет успешную стратегию при подтвержденном ответе от сервера и сохраняет на диск
     pub fn record_success(&self, domain: &str, strategy: SplitStrategy) {
         let family = extract_family_domain(domain);
         let strategies = Self::get_strategies_for(domain);
@@ -78,6 +85,7 @@ impl AdaptiveEngine {
             let prev = cache.insert(family.clone(), idx);
             if prev != Some(idx) {
                 info!("✓ Стратегия {:?} закреплена как успешная для {}", strategy, family);
+                save_cache_to_disk(&cache);
             } else {
                 debug!("Стратегия {:?} подтверждена для {}", strategy, family);
             }
@@ -92,6 +100,7 @@ impl AdaptiveEngine {
         let cur_idx = cache.get(&family).copied().unwrap_or(0);
         let next_idx = (cur_idx + 1) % strategies.len();
         cache.insert(family.clone(), next_idx);
+        save_cache_to_disk(&cache);
         let next_strat = strategies[next_idx];
         info!(
             "⚡ ТСПУ заблокировал {:?} для {}. Адаптивно переключаем на -> {:?}",
@@ -104,6 +113,38 @@ impl AdaptiveEngine {
 impl Default for AdaptiveEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn get_cache_path() -> Option<PathBuf> {
+    if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+        let dir = PathBuf::from(local_appdata).join("Smoke");
+        let _ = std::fs::create_dir_all(&dir);
+        Some(dir.join("cache.json"))
+    } else {
+        Some(PathBuf::from("smoke_cache.json"))
+    }
+}
+
+fn load_cache_from_disk() -> HashMap<String, usize> {
+    if let Some(path) = get_cache_path() {
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(map) = serde_json::from_str::<HashMap<String, usize>>(&content) {
+                    info!("✓ Загружен диск-кэш стратегий ({} доменов) из {}", map.len(), path.display());
+                    return map;
+                }
+            }
+        }
+    }
+    HashMap::new()
+}
+
+fn save_cache_to_disk(cache: &HashMap<String, usize>) {
+    if let Some(path) = get_cache_path() {
+        if let Ok(json) = serde_json::to_string_pretty(cache) {
+            let _ = std::fs::write(&path, json);
+        }
     }
 }
 
