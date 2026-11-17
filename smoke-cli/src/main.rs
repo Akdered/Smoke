@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "smoke",
     about = "Высокоскоростной DPI-bypass прокси для Windows",
-    version = "0.3.0"
+    version = "0.3.1"
 )]
 struct Args {
     /// Адрес и порт для запуска прокси
@@ -27,6 +27,10 @@ struct Args {
     /// Не включать системный прокси Windows (для ручной настройки в приложениях)
     #[arg(long)]
     no_sysproxy: bool,
+
+    /// Экстренно отключить системный прокси Windows и выйти
+    #[arg(long)]
+    clean: bool,
 
     /// Подробный вывод логов (DEBUG)
     #[arg(short, long)]
@@ -53,6 +57,13 @@ enum StrategyArg {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Если передан флаг --clean — просто сбрасываем системный прокси и выходим
+    if args.clean {
+        sysproxy::disable_raw();
+        println!("Системный прокси Windows отключен. Настройки сети сброшены.");
+        return Ok(());
+    }
+
     let default_filter = if args.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -67,6 +78,9 @@ async fn main() -> Result<()> {
         default_panic(info);
     }));
 
+    // Страховка №2: перехватываем нажатие на крестик [X], выход из системы или перезагрузку Windows
+    setup_console_close_handler();
+
     println!(
         r#"
    _____                     __          
@@ -74,7 +88,7 @@ async fn main() -> Result<()> {
   \__ \ / __ `__ \ / __ \  / //_// _ \   
  ___/ // / / / / // /_/ / / ,<  /  __/   
 /____//_/ /_/ /_/ \____/ /_/|_| \___/    
-    High-Performance DPI Bypass Engine v0.3.0
+    High-Performance DPI Bypass Engine v0.3.1
 "#
     );
 
@@ -108,9 +122,9 @@ async fn main() -> Result<()> {
         "Сервер Smoke готов к работе на http://{} и socks5://{}",
         args.bind, args.bind
     );
-    info!("Для остановки и восстановления настроек нажмите Ctrl + C.");
+    info!("Для остановки и восстановления настроек нажмите Ctrl + C (или закройте окно).");
 
-    // Страховка №2: корректно ловим Ctrl + C для чистого восстановления
+    // Страховка №3: корректно ловим Ctrl + C для чистого восстановления
     tokio::select! {
         res = smoke_core::socks5::run_server(bind_addr, dns, strategy) => {
             if let Err(e) = res {
@@ -131,3 +145,29 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+/// Регистрирует низкоуровневый Win32 обработчик закрытия окна консоли [X],
+/// завершения сеанса пользователя или перезагрузки Windows
+#[cfg(target_os = "windows")]
+fn setup_console_close_handler() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+    }
+
+    unsafe extern "system" fn handler(_ctrl_type: u32) -> i32 {
+        // 0: CTRL_C, 1: CTRL_BREAK, 2: CTRL_CLOSE, 5: CTRL_LOGOFF, 6: CTRL_SHUTDOWN
+        sysproxy::disable_raw();
+        0 // Возвращаем 0 (FALSE), чтобы Windows продолжила штатный выход
+    }
+
+    unsafe {
+        SetConsoleCtrlHandler(Some(handler), 1);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn setup_console_close_handler() {}
