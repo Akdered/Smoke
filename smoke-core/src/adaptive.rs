@@ -100,7 +100,6 @@ impl AdaptiveEngine {
         let cur_idx = cache.get(&family).copied().unwrap_or(0);
         let next_idx = (cur_idx + 1) % strategies.len();
         cache.insert(family.clone(), next_idx);
-        save_cache_to_disk(&cache);
         let next_strat = strategies[next_idx];
         info!(
             "⚡ ТСПУ заблокировал {:?} для {}. Адаптивно переключаем на -> {:?}",

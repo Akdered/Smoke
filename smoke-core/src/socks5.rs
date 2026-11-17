@@ -338,7 +338,7 @@ async fn relay_with_desync(
         }
 
         let mut resp_first = [0u8; 1];
-        match timeout(Duration::from_millis(1200), stream.read(&mut resp_first)).await {
+        match timeout(Duration::from_millis(2500), stream.read(&mut resp_first)).await {
             Ok(Ok(n)) if n > 0 => {
                 engine.record_success(resolved_host, active_strategy);
                 client.write_all(&resp_first[..n]).await?;
