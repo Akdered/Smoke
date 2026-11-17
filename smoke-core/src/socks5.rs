@@ -73,25 +73,23 @@ async fn handle_http_proxy(
     dns: DnsResolver,
     strategy: SplitStrategy,
 ) -> Result<()> {
-    let mut buf = [0u8; 4096];
-    let mut filled = 0;
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 2048];
 
-    // Читаем HTTP-заголовок до пустой строки \r\n\r\n
+    // Читаем HTTP-заголовок до пустой строки \r\n\r\n (динамически до 64 КБ)
     let header_end = loop {
-        let slice = buf.get_mut(filled..).ok_or(SmokeError::InvalidDomain)?;
-        if slice.is_empty() {
-            return Err(SmokeError::InvalidDomain);
-        }
-        let n = client.read(slice).await?;
+        let n = client.read(&mut chunk).await?;
         if n == 0 {
             return Ok(());
         }
-        filled += n;
+        buf.extend_from_slice(&chunk[..n]);
 
-        if let Some(window_slice) = buf.get(..filled) {
-            if let Some(pos) = window_slice.windows(4).position(|w| w == b"\r\n\r\n") {
-                break pos + 4;
-            }
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+
+        if buf.len() > 65536 {
+            return Err(SmokeError::InvalidDomain);
         }
     };
 
@@ -104,7 +102,7 @@ async fn handle_http_proxy(
     let target = parts.next().ok_or(SmokeError::InvalidDomain)?;
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        // HTTPS туннель (например, CONNECT ://youtube.com HTTP/1.1)
+        // HTTPS туннель (например, CONNECT youtube.com:443 HTTP/1.1)
         let (host, port) = parse_host_port(target, 443)?;
         let target_addr = dns.resolve(&host, port).await?;
 
@@ -133,22 +131,35 @@ async fn handle_http_proxy(
         let target_addr = dns.resolve(&host, port).await?;
 
         let mut remote = connect_optimized(target_addr).await?;
-        if let Some(all_read) = buf.get(..filled) {
-            remote.write_all(all_read).await?;
-        }
+        let active_strategy = if is_private_ip(target_addr.ip()) {
+            SplitStrategy::None
+        } else {
+            strategy
+        };
+
+        send_desync(&mut remote, &buf, active_strategy).await?;
         let _ = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
         Ok(())
     }
 }
 
 fn parse_host_port(s: &str, default_port: u16) -> Result<(String, u16)> {
-    if let Some((h, p)) = s.rsplit_once(':') {
+    // Убираем протокольные префиксы, если передан абсолютный URI
+    let clean = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or(s);
+
+    let host_and_port = clean.split('/').next().unwrap_or(clean);
+
+    if let Some((h, p)) = host_and_port.rsplit_once(':') {
         if let Ok(port) = p.parse::<u16>() {
             let clean_host = h.trim_matches(|c| c == '[' || c == ']');
             return Ok((clean_host.to_string(), port));
         }
     }
-    Ok((s.to_string(), default_port))
+    let clean_host = host_and_port.trim_matches(|c| c == '[' || c == ']');
+    Ok((clean_host.to_string(), default_port))
 }
 
 async fn handle_socks5(
@@ -241,14 +252,19 @@ async fn relay_with_desync(
         strategy
     };
 
-    let mut first_buf = [0u8; 8192];
-    if let Ok(result) = timeout(Duration::from_millis(300), client.read(&mut first_buf)).await {
-        let n = result?;
-        if n == 0 {
-            return Ok(());
+    let mut first_buf = [0u8; 16384];
+    // Ожидаем первый пакет от клиента с надежным таймаутом (до 10 секунд)
+    match timeout(Duration::from_secs(10), client.read(&mut first_buf)).await {
+        Ok(Ok(0)) => return Ok(()),
+        Ok(Ok(n)) => {
+            if let Some(slice) = first_buf.get(..n) {
+                send_desync(&mut remote, slice, active_strategy).await?;
+            }
         }
-        if let Some(slice) = first_buf.get(..n) {
-            send_desync(&mut remote, slice, active_strategy).await?;
+        Ok(Err(e)) => return Err(SmokeError::Io(e)),
+        Err(_) => {
+            // Клиент подключился, но ничего не прислал за 10 секунд
+            return Ok(());
         }
     }
 

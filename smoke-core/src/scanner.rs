@@ -11,13 +11,21 @@ use tracing::{debug, info};
 
 /// Автоматически тестирует стратегии параллельно и возвращает самую быструю рабочую
 pub async fn auto_select_strategy(dns: &DnsResolver) -> SplitStrategy {
-    let test_domain = "www.youtube.com";
-    info!("Автоподбор оптимальной стратегии для сети ({})...", test_domain);
+    let test_domains = ["www.youtube.com", "googlevideo.com", "discord.com"];
 
-    let target_addr = match dns.resolve(test_domain, 443).await {
-        Ok(addr) => addr,
-        Err(_) => {
-            info!("Не удалось разрешить тестовый домен, выбран режим TlsRecordAndSni");
+    let mut target_info = None;
+    for &domain in &test_domains {
+        info!("Автоподбор оптимальной стратегии для сети (проверка {})...", domain);
+        if let Ok(addr) = dns.resolve(domain, 443).await {
+            target_info = Some((domain, addr));
+            break;
+        }
+    }
+
+    let (test_domain, target_addr) = match target_info {
+        Some(info) => info,
+        None => {
+            info!("Не удалось разрешить тестовые домены, включен усиленный режим TlsRecordAndSni");
             return SplitStrategy::TlsRecordAndSni;
         }
     };
@@ -25,7 +33,7 @@ pub async fn auto_select_strategy(dns: &DnsResolver) -> SplitStrategy {
     let candidates = [
         SplitStrategy::TlsRecordAndSni,
         SplitStrategy::SniMiddle { fallback_pos: 2 },
-        SplitStrategy::SniMiddle { fallback_pos: 1 },
+        SplitStrategy::FakeTtl { fake_ttl: 3, fallback_pos: 2 },
     ];
 
     let client_hello = build_test_client_hello(test_domain);
@@ -36,7 +44,7 @@ pub async fn auto_select_strategy(dns: &DnsResolver) -> SplitStrategy {
         set.spawn(async move {
             let start = Instant::now();
             match timeout(
-                Duration::from_millis(1800),
+                Duration::from_millis(2200),
                 probe_strategy(target_addr, &packet, strat),
             )
             .await
@@ -61,7 +69,7 @@ pub async fn auto_select_strategy(dns: &DnsResolver) -> SplitStrategy {
             winner
         }
         None => {
-            info!("Автоподбор не выявил фаворита, включен усиленный режим TlsRecordAndSni");
+            info!("Автоподбор не выявил явного ответа от тестового узла, включен режим TlsRecordAndSni");
             SplitStrategy::TlsRecordAndSni
         }
     }
@@ -107,7 +115,7 @@ async fn probe_strategy(
 }
 
 /// Собирает компактный валидный пакет TLS 1.2 ClientHello с расширением SNI для проверки сети
-fn build_test_client_hello(domain: &str) -> Vec<u8> {
+pub fn build_test_client_hello(domain: &str) -> Vec<u8> {
     let name_bytes = domain.as_bytes();
     let name_len = name_bytes.len() as u16;
 

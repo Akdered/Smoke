@@ -10,25 +10,30 @@ use tracing::{debug, warn};
 #[derive(Clone)]
 pub struct DnsResolver {
     doh_google: Arc<TokioAsyncResolver>,
+    doh_cloudflare: Arc<TokioAsyncResolver>,
     doh_quad9: Arc<TokioAsyncResolver>,
 }
 
 impl DnsResolver {
     pub fn new_doh() -> Self {
         let mut opts = ResolverOpts::default();
-        opts.cache_size = 2048;
-        opts.timeout = Duration::from_secs(2);
+        opts.cache_size = 4096;
+        opts.timeout = Duration::from_millis(1500);
         opts.attempts = 1;
         opts.use_hosts_file = true;
 
         // Основной шифрованный канал: Google DoH (8.8.8.8 / 8.8.4.4)
         let doh_google = TokioAsyncResolver::tokio(ResolverConfig::google_https(), opts.clone());
 
+        // Второй шифрованный канал: Cloudflare DoH (1.1.1.1 / 1.0.0.1)
+        let doh_cloudflare = TokioAsyncResolver::tokio(ResolverConfig::cloudflare_https(), opts.clone());
+
         // Резервный шифрованный канал: Quad9 DoH (9.9.9.9)
         let doh_quad9 = TokioAsyncResolver::tokio(ResolverConfig::quad9_https(), opts);
 
         Self {
             doh_google: Arc::new(doh_google),
+            doh_cloudflare: Arc::new(doh_cloudflare),
             doh_quad9: Arc::new(doh_quad9),
         }
     }
@@ -44,14 +49,20 @@ impl DnsResolver {
             return Ok(SocketAddr::new(ip, port));
         }
 
-        // 2. Если провайдер режет Google DoH — пробуем Quad9 DoH
+        // 2. Если Google DoH блокируется — пробуем Cloudflare DoH
+        if let Some(ip) = Self::try_lookup(&self.doh_cloudflare, domain).await {
+            debug!("Cloudflare DoH: {} -> {}", domain, ip);
+            return Ok(SocketAddr::new(ip, port));
+        }
+
+        // 3. Если Cloudflare тоже недоступен — пробуем Quad9 DoH
         if let Some(ip) = Self::try_lookup(&self.doh_quad9, domain).await {
             debug!("Quad9 DoH: {} -> {}", domain, ip);
             return Ok(SocketAddr::new(ip, port));
         }
 
-        // 3. Железобетонный резерв через системный резолвер (чтобы сеть никогда не отваливалась)
-        warn!("DoH недоступен для {}, используем резервный DNS", domain);
+        // 4. Резерв через системный резолвер (чтобы связь не обрывалась)
+        warn!("Все DoH недоступны для {}, используем системный DNS", domain);
         let addr = lookup_host((domain, port))
             .await
             .map_err(SmokeError::Io)?
