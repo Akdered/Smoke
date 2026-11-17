@@ -88,6 +88,7 @@ async fn main() -> Result<()> {
   \__ \ / __ `__ \ / __ \  / //_// _ \   
  ___/ // / / / / // /_/ / / ,<  /  __/   
 /____//_/ /_/ /_/ \____/ /_/|_| \___/    
+             by Akdered
     High-Performance DPI Bypass Engine v0.3.1
 "#
     );

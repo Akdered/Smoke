@@ -10,7 +10,8 @@
   \__ \ / __ `__ \ / __ \  / //_// _ \   
  ___/ // / / / / // /_/ / / ,<  /  __/   
 /____//_/ /_/ /_/ \____/ /_/|_| \___/    
-    High-Performance DPI Bypass Engine v0.3.0
+             by Akdered
+    High-Performance DPI Bypass Engine v0.3.1
 ```
 
 ---
