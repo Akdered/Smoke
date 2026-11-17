@@ -3,19 +3,34 @@ use tokio::io::{AsyncWriteExt, Result};
 use tokio::net::TcpStream;
 use tracing::debug;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SplitStrategy {
     /// Отправка без изменений
     None,
-    /// Разрез ровно посередине имени домена (SNI), иначе на заданном байте
-    SniMiddle { fallback_pos: usize },
-    /// Двойной разрез: после 2-го байта TLS заголовка + посередине SNI (мощный режим)
-    TlsRecordAndSni,
-    /// Фрагментация TLS-записи: один ClientHello разбивается на 3-4 TLS Record'а
+    /// 1. TlsRecordFrag: разбиение на 3-4 TLS Record (заголовок, до SNI, центр SNI, остаток)
     TlsRecordFrag,
-    /// Двухзвенная фрагментация: 1-й TLS Record несет ровно 1 байт handshake, 2-й — остаток.
-    /// Максимально совместимый и устойчивый режим: скрывает SNI от DPI при 100% совместимости с серверами.
+    /// 2. TlsRecordFrag2: двухзвенная фрагментация (1 байт в 1-м рекорде, остаток во 2-м)
     TlsRecordFrag2,
+    /// 3. TlsRecordFragSni: разрез TLS Record ровно перед началом расширения SNI
+    TlsRecordFragSni,
+    /// 4. Disorder1: отправка 1-го байта с TTL=1 (умирает на 1-м узле), ретрансмит через SACK
+    Disorder1,
+    /// 5. DisorderSni: отправка заголовка до середины SNI с TTL=1, ретрансмит через SACK
+    DisorderSni,
+    /// 6. OobSni: инъекция Out-of-band (TCP Urgent Pointer) байта в середину SNI
+    OobSni,
+    /// 7. TcpSplit1: чистый TCP-сплит после 1-го байта
+    TcpSplit1,
+    /// 8. TcpSplit2: чистый TCP-сплит после 2-го байта (0x16 0x03)
+    TcpSplit2,
+    /// 9. TcpSplitSni: чистый TCP-сплит в середине домена
+    TcpSplitSni,
+    /// 10. Combo: 2-рекордная фрагментация + TCP Disorder на 1-м рекорде
+    Combo,
+
+    // Совместимость со старыми вызовами
+    SniMiddle { fallback_pos: usize },
+    TlsRecordAndSni,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,13 +69,69 @@ pub async fn send_desync(
     match strategy {
         SplitStrategy::None => remote.write_all(buf).await,
 
+        SplitStrategy::TlsRecordFrag => {
+            if is_tls_handshake(buf) {
+                return send_tls_record_fragmented(remote, buf).await;
+            }
+            fallback_http_or_split(remote, buf, 2).await
+        }
+
+        SplitStrategy::TlsRecordFrag2 => {
+            if is_tls_handshake(buf) {
+                return send_tls_record_frag_2(remote, buf).await;
+            }
+            fallback_http_or_split(remote, buf, 1).await
+        }
+
+        SplitStrategy::TlsRecordFragSni => {
+            if is_tls_handshake(buf) {
+                return send_tls_record_frag_sni(remote, buf).await;
+            }
+            fallback_http_or_split(remote, buf, 2).await
+        }
+
+        SplitStrategy::Disorder1 => {
+            send_disorder(remote, buf, 1, 1).await
+        }
+
+        SplitStrategy::DisorderSni => {
+            let pos = find_sni_middle(buf)
+                .or_else(|| find_http_host_split(buf))
+                .unwrap_or(2.min(buf.len() - 1).max(1));
+            send_disorder(remote, buf, pos, 1).await
+        }
+
+        SplitStrategy::OobSni => {
+            send_oob_at_sni(remote, buf).await
+        }
+
+        SplitStrategy::TcpSplit1 => {
+            write_split_2(remote, &buf[..1], &buf[1..]).await
+        }
+
+        SplitStrategy::TcpSplit2 => {
+            let pos = 2.min(buf.len() - 1).max(1);
+            write_split_2(remote, &buf[..pos], &buf[pos..]).await
+        }
+
+        SplitStrategy::TcpSplitSni => {
+            let pos = find_sni_middle(buf)
+                .or_else(|| find_http_host_split(buf))
+                .unwrap_or(2.min(buf.len() - 1).max(1));
+            write_split_2(remote, &buf[..pos], &buf[pos..]).await
+        }
+
+        SplitStrategy::Combo => {
+            send_combo(remote, buf).await
+        }
+
         SplitStrategy::SniMiddle { fallback_pos } => {
             let split_pos = find_sni_middle(buf)
                 .or_else(|| find_http_host_split(buf))
                 .unwrap_or_else(|| fallback_pos.min(buf.len() - 1).max(1));
 
             let (first, second) = buf.split_at(split_pos);
-            debug!("SniMiddle split пакета ({} байт) в точке {}", buf.len(), split_pos);
+            debug!("SniMiddle split в точке {}", split_pos);
             write_split_2(remote, first, second).await
         }
 
@@ -77,39 +148,6 @@ pub async fn send_desync(
 
             if let Some(http_pos) = find_http_host_split(buf) {
                 let (first, second) = buf.split_at(http_pos);
-                debug!("HTTP Host split в точке {}", http_pos);
-                return write_split_2(remote, first, second).await;
-            }
-
-            let pos = 2.min(buf.len() - 1).max(1);
-            let (first, second) = buf.split_at(pos);
-            write_split_2(remote, first, second).await
-        }
-
-        SplitStrategy::TlsRecordFrag => {
-            if is_tls_handshake(buf) {
-                return send_tls_record_fragmented(remote, buf).await;
-            }
-
-            if let Some(http_pos) = find_http_host_split(buf) {
-                let (first, second) = buf.split_at(http_pos);
-                debug!("HTTP Host split в точке {}", http_pos);
-                return write_split_2(remote, first, second).await;
-            }
-
-            let pos = 2.min(buf.len() - 1).max(1);
-            let (first, second) = buf.split_at(pos);
-            write_split_2(remote, first, second).await
-        }
-
-        SplitStrategy::TlsRecordFrag2 => {
-            if is_tls_handshake(buf) {
-                return send_tls_record_frag_2(remote, buf).await;
-            }
-
-            if let Some(http_pos) = find_http_host_split(buf) {
-                let (first, second) = buf.split_at(http_pos);
-                debug!("HTTP Host split в точке {}", http_pos);
                 return write_split_2(remote, first, second).await;
             }
 
@@ -120,40 +158,187 @@ pub async fn send_desync(
     }
 }
 
-/// Разбивает один TLS Record (ClientHello) на несколько маленьких TLS Record'ов.
-///
-/// Идея: ТСПУ ожидает один Record с полным ClientHello внутри.
-/// Если мы разобьём handshake payload на 3-4 отдельных TLS Record'а (каждый с
-/// собственным 5-байтным заголовком 0x16 0x03 0x01 LEN), парсер ТСПУ не сможет
-/// реассемблировать SNI, т.к. большинство DPI-коробок не реализуют TLS record reassembly.
-///
-/// Это ВАЛИДНЫЙ TLS: RFC 8446 §5.1 разрешает фрагментировать Handshake-сообщения
-/// по границам Record'ов, и все серверы обязаны это поддерживать.
+async fn fallback_http_or_split(remote: &mut TcpStream, buf: &[u8], default_pos: usize) -> Result<()> {
+    if let Some(http_pos) = find_http_host_split(buf) {
+        let (first, second) = buf.split_at(http_pos);
+        return write_split_2(remote, first, second).await;
+    }
+    let pos = default_pos.min(buf.len() - 1).max(1);
+    let (first, second) = buf.split_at(pos);
+    write_split_2(remote, first, second).await
+}
+
+fn set_stream_ttl(stream: &TcpStream, ttl: u32) {
+    let sock = socket2::SockRef::from(stream);
+    let _ = sock.set_ttl(ttl);
+}
+
+fn get_stream_ttl(stream: &TcpStream) -> u32 {
+    let sock = socket2::SockRef::from(stream);
+    sock.ttl().unwrap_or(128)
+}
+
+fn send_stream_oob(stream: &TcpStream, byte: u8) {
+    let sock = socket2::SockRef::from(stream);
+    let _ = sock.send_out_of_band(&[byte]);
+}
+
+/// Легендарный трюк Disorder (ByeDPI/Zapret-style):
+/// 1-й сегмент отправляется с TTL=1 (или 2), погибает на первом роутере и не доходит до сервера.
+/// 2-й сегмент уходит с нормальным TTL и приходит на сервер ПЕРВЫМ.
+/// Сервер просит ретрансмит через SACK, и ОС досылает 1-й сегмент.
+/// Для ТСПУ порядок следования сегментов инвертирован (Part 2 -> Part 1), сборка SNI ломается!
+async fn send_disorder(
+    remote: &mut TcpStream,
+    buf: &[u8],
+    split_pos: usize,
+    low_ttl: u32,
+) -> Result<()> {
+    if split_pos == 0 || split_pos >= buf.len() {
+        return remote.write_all(buf).await;
+    }
+
+    let (first, second) = buf.split_at(split_pos);
+    let orig_ttl = get_stream_ttl(remote);
+
+    debug!("Disorder: 1-я часть ({} байт) с TTL={}, 2-я часть ({} байт)", first.len(), low_ttl, second.len());
+
+    // 1. Посылаем 1-ю часть с умирающим TTL
+    set_stream_ttl(remote, low_ttl);
+    remote.write_all(first).await?;
+    remote.flush().await?;
+
+    // Пауза, чтобы пакет точно ушел с низким TTL
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    // 2. Восстанавливаем оригинальный TTL и шлем 2-ю часть
+    set_stream_ttl(remote, orig_ttl);
+    remote.write_all(second).await?;
+    remote.flush().await
+}
+
+/// Инъекция Out-of-Band байта (TCP Urgent Pointer):
+/// Посылается 1 OOB-байт между половинами SNI. ТСПУ включает его в сигнатуру и не узнает домен,
+/// а веб-сервер игнорирует OOB-данные, сохраняя чистоту TLS-потока.
+async fn send_oob_at_sni(remote: &mut TcpStream, buf: &[u8]) -> Result<()> {
+    let split_pos = find_sni_middle(buf)
+        .or_else(|| find_http_host_split(buf))
+        .unwrap_or(2.min(buf.len() - 1).max(1));
+
+    let (first, second) = buf.split_at(split_pos);
+    debug!("OOB injection: split в точке {}", split_pos);
+
+    remote.write_all(first).await?;
+    remote.flush().await?;
+
+    // Отправляем OOB байт
+    send_stream_oob(remote, b'a');
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    remote.write_all(second).await?;
+    remote.flush().await
+}
+
+/// Комбо-метод: двухзвенный TLS Record + TCP Disorder на 1-м рекорде
+async fn send_combo(remote: &mut TcpStream, buf: &[u8]) -> Result<()> {
+    if is_tls_handshake(buf) && buf.len() > 6 {
+        let content_type = buf[0];
+        let version_hi = buf[1];
+        let version_lo = buf[2];
+        let handshake_payload = &buf[5..];
+
+        let frag1 = &handshake_payload[..1];
+        let frag2 = &handshake_payload[1..];
+
+        let mut rec1 = Vec::with_capacity(6);
+        rec1.push(content_type);
+        rec1.push(version_hi);
+        rec1.push(version_lo);
+        rec1.extend_from_slice(&1u16.to_be_bytes());
+        rec1.extend_from_slice(frag1);
+
+        let mut rec2 = Vec::with_capacity(5 + frag2.len());
+        rec2.push(content_type);
+        rec2.push(version_hi);
+        rec2.push(version_lo);
+        rec2.extend_from_slice(&(frag2.len() as u16).to_be_bytes());
+        rec2.extend_from_slice(frag2);
+
+        let orig_ttl = get_stream_ttl(remote);
+
+        debug!("Combo: Record 1 с TTL=1, Record 2 с нормальным TTL");
+
+        set_stream_ttl(remote, 1);
+        remote.write_all(&rec1).await?;
+        remote.flush().await?;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        set_stream_ttl(remote, orig_ttl);
+        remote.write_all(&rec2).await?;
+        remote.flush().await
+    } else {
+        write_split_2(remote, &buf[..1], &buf[1..]).await
+    }
+}
+
+/// Фрагментация рекордов ровно перед началом SNI
+async fn send_tls_record_frag_sni(remote: &mut TcpStream, buf: &[u8]) -> Result<()> {
+    if buf.len() < 6 {
+        return remote.write_all(buf).await;
+    }
+    let content_type = buf[0];
+    let version_hi = buf[1];
+    let version_lo = buf[2];
+    let handshake_payload = &buf[5..];
+
+    if let Some(sni_info) = find_sni_range(buf) {
+        let split_in_payload = sni_info.start.saturating_sub(5);
+        if split_in_payload > 0 && split_in_payload < handshake_payload.len() {
+            let frag1 = &handshake_payload[..split_in_payload];
+            let frag2 = &handshake_payload[split_in_payload..];
+
+            let mut rec1 = Vec::with_capacity(5 + frag1.len());
+            rec1.push(content_type);
+            rec1.push(version_hi);
+            rec1.push(version_lo);
+            rec1.extend_from_slice(&(frag1.len() as u16).to_be_bytes());
+            rec1.extend_from_slice(frag1);
+
+            let mut rec2 = Vec::with_capacity(5 + frag2.len());
+            rec2.push(content_type);
+            rec2.push(version_hi);
+            rec2.push(version_lo);
+            rec2.extend_from_slice(&(frag2.len() as u16).to_be_bytes());
+            rec2.extend_from_slice(frag2);
+
+            debug!("TLS Record Frag SNI: до SNI ({} байт) + с SNI ({} байт)", rec1.len(), rec2.len());
+
+            remote.write_all(&rec1).await?;
+            remote.flush().await?;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            remote.write_all(&rec2).await?;
+            return remote.flush().await;
+        }
+    }
+    send_tls_record_frag_2(remote, buf).await
+}
+
+/// Разбивает один TLS Record (ClientHello) на несколько маленьких TLS Record'ов
 async fn send_tls_record_fragmented(remote: &mut TcpStream, buf: &[u8]) -> Result<()> {
-    // buf = [ContentType(1) | Version(2) | Length(2) | handshake_payload...]
     if buf.len() < 6 {
         return remote.write_all(buf).await;
     }
 
-    let content_type = buf[0];       // 0x16
-    let version_hi = buf[1];         // 0x03
-    let version_lo = buf[2];         // 0x01 или 0x03
-
-    let handshake_payload = &buf[5..]; // всё после 5-байтного Record Header
+    let content_type = buf[0];
+    let version_hi = buf[1];
+    let version_lo = buf[2];
+    let handshake_payload = &buf[5..];
 
     if handshake_payload.is_empty() {
         return remote.write_all(buf).await;
     }
 
-    // Определяем точки разреза: хотим, чтобы SNI оказался разбит между Record'ами
     let split_points = compute_record_split_points(buf, handshake_payload.len());
-
-    debug!(
-        "TLS Record Fragmentation: {} байт payload -> {} фрагментов, точки: {:?}",
-        handshake_payload.len(),
-        split_points.len() + 1,
-        split_points
-    );
 
     let mut start = 0;
     for (i, &split) in split_points.iter().enumerate() {
@@ -165,7 +350,6 @@ async fn send_tls_record_fragmented(remote: &mut TcpStream, buf: &[u8]) -> Resul
         let fragment = &handshake_payload[start..end];
         let frag_len = fragment.len() as u16;
 
-        // Собираем TLS Record Header для этого фрагмента
         let mut record = Vec::with_capacity(5 + fragment.len());
         record.push(content_type);
         record.push(version_hi);
@@ -176,7 +360,6 @@ async fn send_tls_record_fragmented(remote: &mut TcpStream, buf: &[u8]) -> Resul
         remote.write_all(&record).await?;
         remote.flush().await?;
 
-        // Микропауза между фрагментами (гарантирует раздельные TCP-сегменты)
         if i < split_points.len() - 1 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -184,7 +367,6 @@ async fn send_tls_record_fragmented(remote: &mut TcpStream, buf: &[u8]) -> Resul
         start = end;
     }
 
-    // Последний фрагмент (остаток)
     if start < handshake_payload.len() {
         let fragment = &handshake_payload[start..];
         let frag_len = fragment.len() as u16;
@@ -202,12 +384,7 @@ async fn send_tls_record_fragmented(remote: &mut TcpStream, buf: &[u8]) -> Resul
     Ok(())
 }
 
-/// Фрагментирует ClientHello ровно на 2 TLS Record:
-/// Record 1: ровно 1 байт handshake (0x01 ClientHello)
-/// Record 2: весь остальной handshake payload (содержит SNI)
-///
-/// ТСПУ не находит SNI в 1-м рекорде (так как длина всего 1 байт),
-/// а 2-й рекорд воспринимает как продолжение и не сканирует заголовок ClientHello.
+/// Фрагментирует ClientHello ровно на 2 TLS Record
 async fn send_tls_record_frag_2(remote: &mut TcpStream, buf: &[u8]) -> Result<()> {
     if buf.len() < 6 {
         return remote.write_all(buf).await;
@@ -225,7 +402,6 @@ async fn send_tls_record_frag_2(remote: &mut TcpStream, buf: &[u8]) -> Result<()
     let frag1 = &handshake_payload[..1];
     let frag2 = &handshake_payload[1..];
 
-    // Record 1
     let mut rec1 = Vec::with_capacity(6);
     rec1.push(content_type);
     rec1.push(version_hi);
@@ -233,7 +409,6 @@ async fn send_tls_record_frag_2(remote: &mut TcpStream, buf: &[u8]) -> Result<()
     rec1.extend_from_slice(&1u16.to_be_bytes());
     rec1.extend_from_slice(frag1);
 
-    // Record 2
     let mut rec2 = Vec::with_capacity(5 + frag2.len());
     rec2.push(content_type);
     rec2.push(version_hi);
@@ -241,10 +416,7 @@ async fn send_tls_record_frag_2(remote: &mut TcpStream, buf: &[u8]) -> Result<()
     rec2.extend_from_slice(&(frag2.len() as u16).to_be_bytes());
     rec2.extend_from_slice(frag2);
 
-    debug!(
-        "TLS Record Frag2: Record 1 (6 байт) + Record 2 ({} байт)",
-        rec2.len()
-    );
+    debug!("TLS Record Frag2: Rec 1 (6 байт) + Rec 2 ({} байт)", rec2.len());
 
     remote.write_all(&rec1).await?;
     remote.flush().await?;
@@ -253,33 +425,25 @@ async fn send_tls_record_frag_2(remote: &mut TcpStream, buf: &[u8]) -> Result<()
     remote.flush().await
 }
 
-/// Вычисляет оптимальные точки разреза payload для TLS Record Fragmentation.
-/// Старается разрезать так, чтобы SNI-расширение оказалось разнесено между Record'ами.
 fn compute_record_split_points(full_buf: &[u8], payload_len: usize) -> Vec<usize> {
     let mut points = Vec::new();
 
-    // Если мы знаем, где SNI — разрезаем прямо перед ним, посередине и после
     if let Some(sni_info) = find_sni_range(full_buf) {
-        // Смещение SNI внутри payload (SNI start в buf минус 5 байт Record Header)
         let sni_start_in_payload = sni_info.start.saturating_sub(5);
         let sni_mid_in_payload = sni_info.middle().saturating_sub(5);
 
-        // Первый разрез: 1 байт (сбивает парсер ТСПУ, который ожидает полный Handshake header)
         if payload_len > 1 {
             points.push(1);
         }
 
-        // Второй разрез: перед началом SNI (если это дальше первого разреза)
         if sni_start_in_payload > 2 {
             points.push(sni_start_in_payload);
         }
 
-        // Третий разрез: посередине имени хоста в SNI
         if sni_mid_in_payload > sni_start_in_payload + 1 {
             points.push(sni_mid_in_payload);
         }
     } else {
-        // Если SNI не найден — равномерная фрагментация
         if payload_len > 10 {
             points.push(1);
             points.push(payload_len / 3);
@@ -291,9 +455,7 @@ fn compute_record_split_points(full_buf: &[u8], payload_len: usize) -> Vec<usize
 
     points.sort();
     points.dedup();
-    // Убираем нулевые и выходящие за границы
     points.retain(|&p| p > 0 && p < payload_len);
-
     points
 }
 
@@ -439,9 +601,7 @@ mod tests {
         let hello = crate::scanner::build_test_client_hello(domain);
         let payload_len = hello.len() - 5;
         let points = compute_record_split_points(&hello, payload_len);
-        // Должно быть несколько точек разреза
         assert!(!points.is_empty());
-        // Все точки в пределах payload
         for &p in &points {
             assert!(p > 0 && p < payload_len);
         }

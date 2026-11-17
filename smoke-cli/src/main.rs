@@ -13,16 +13,24 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "smoke",
     about = "Высокоскоростной DPI-bypass прокси для Windows",
-    version = "0.3.1"
+    version = "0.4.0"
 )]
 struct Args {
     /// Адрес и порт для запуска прокси
     #[arg(short, long, default_value = "127.0.0.1:1080")]
     bind: String,
 
-    /// Стратегия десинхронизации (по умолчанию: tls-record-frag для мгновенного старта)
-    #[arg(short, long, value_enum, default_value = "tls-record-frag")]
-    strategy: StrategyArg,
+    /// Пресет обхода (по умолчанию: auto — умный самообучающийся режим)
+    #[arg(short, long, value_enum, default_value = "auto")]
+    preset: PresetArg,
+
+    /// Принудительно зафиксировать конкретную стратегию (переопределяет пресет)
+    #[arg(short, long, value_enum)]
+    strategy: Option<StrategyArg>,
+
+    /// Запустить предварительный бенчмарк сети перед стартом
+    #[arg(long)]
+    scan: bool,
 
     /// Не включать системный прокси Windows (для ручной настройки в приложениях)
     #[arg(long)]
@@ -38,17 +46,39 @@ struct Args {
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-enum StrategyArg {
-    /// Фрагментация TLS Record Layer (разбиение на 3-4 рекорда, максимальная пробиваемость)
-    TlsRecordFrag,
-    /// Двухзвенная фрагментация TLS Record Layer (1 байт в первом рекорде, максимальная совместимость)
-    TlsRecordFrag2,
-    /// Двойной TCP-сплит: по заголовку TLS Record + по SNI
-    TlsRecord,
-    /// Одинарный TCP-сплит посередине SNI
-    SniMiddle,
-    /// Автоматический подбор стратегии через предварительный зонд сети
+enum PresetArg {
+    /// Умный адаптивный режим: автоматическое переключение стратегий на лету (в 1 клик для всех)
     Auto,
+    /// Пресет для Ростелеком / EcoFilter (TlsRecordFrag)
+    Rtk,
+    /// Пресет для мобильных операторов МТС/Билайн/Мегафон (Disorder1)
+    Mobile,
+    /// Ультимативный комбо-режим против жестких ТСПУ (Combo)
+    Ultra,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum StrategyArg {
+    /// Мульти-рекорды TLS (3-4 фрагмента)
+    TlsRecordFrag,
+    /// Двухзвенный TLS рекорд (1 байт в первом рекорде)
+    TlsRecordFrag2,
+    /// Разрез TLS рекорда перед SNI
+    TlsRecordFragSni,
+    /// Трюк Disorder: 1-й байт с TTL=1, ретрансмит через SACK
+    Disorder1,
+    /// Трюк Disorder до середины SNI с TTL=1, ретрансмит через SACK
+    DisorderSni,
+    /// Инъекция TCP Urgent Pointer (OOB) байта в середине SNI
+    OobSni,
+    /// Чистый TCP-сплит после 1-го байта
+    TcpSplit1,
+    /// Чистый TCP-сплит после 2-го байта (0x16 0x03)
+    TcpSplit2,
+    /// Чистый TCP-сплит в середине домена
+    TcpSplitSni,
+    /// Комбо: 2 TLS-рекорда + TCP Disorder
+    Combo,
     /// Без обработки (для диагностики)
     None,
 }
@@ -57,7 +87,7 @@ enum StrategyArg {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Если передан флаг --clean — просто сбрасываем системный прокси и выходим
+    // Экстренный сброс настроек сети
     if args.clean {
         sysproxy::disable_raw();
         println!("Системный прокси Windows отключен. Настройки сети сброшены.");
@@ -78,7 +108,7 @@ async fn main() -> Result<()> {
         default_panic(info);
     }));
 
-    // Страховка №2: перехватываем нажатие на крестик [X], выход из системы или перезагрузку Windows
+    // Страховка №2: перехватываем закрытие консоли крестиком [X]
     setup_console_close_handler();
 
     println!(
@@ -89,29 +119,49 @@ async fn main() -> Result<()> {
  ___/ // / / / / // /_/ / / ,<  /  __/   
 /____//_/ /_/ /_/ \____/ /_/|_| \___/    
              by Akdered
-    High-Performance DPI Bypass Engine v0.3.1
+    High-Performance DPI Bypass Engine v0.4.0
 "#
     );
 
     let bind_addr: SocketAddr = args.bind.parse()?;
     let dns = DnsResolver::new_doh();
 
-    // Для мгновенного старта без задержек по умолчанию используем TlsRecordFrag
-    let strategy = match args.strategy {
-        StrategyArg::TlsRecordFrag => SplitStrategy::TlsRecordFrag,
-        StrategyArg::TlsRecordFrag2 => SplitStrategy::TlsRecordFrag2,
-        StrategyArg::TlsRecord => SplitStrategy::TlsRecordAndSni,
-        StrategyArg::SniMiddle => SplitStrategy::SniMiddle { fallback_pos: 2 },
-        StrategyArg::Auto => {
-            info!("Запущен автоподбор стратегии для сети...");
-            auto_select_strategy(&dns).await
+    // Определение стратегии:
+    // По умолчанию (args.preset == Auto и strategy == None) включается Smart Adaptive Engine!
+    // Он стартует за 2 мс и сам адаптируется под провайдера на лету.
+    let fixed_strategy: Option<SplitStrategy> = if let Some(strat) = args.strategy {
+        Some(match strat {
+            StrategyArg::TlsRecordFrag => SplitStrategy::TlsRecordFrag,
+            StrategyArg::TlsRecordFrag2 => SplitStrategy::TlsRecordFrag2,
+            StrategyArg::TlsRecordFragSni => SplitStrategy::TlsRecordFragSni,
+            StrategyArg::Disorder1 => SplitStrategy::Disorder1,
+            StrategyArg::DisorderSni => SplitStrategy::DisorderSni,
+            StrategyArg::OobSni => SplitStrategy::OobSni,
+            StrategyArg::TcpSplit1 => SplitStrategy::TcpSplit1,
+            StrategyArg::TcpSplit2 => SplitStrategy::TcpSplit2,
+            StrategyArg::TcpSplitSni => SplitStrategy::TcpSplitSni,
+            StrategyArg::Combo => SplitStrategy::Combo,
+            StrategyArg::None => SplitStrategy::None,
+        })
+    } else if args.scan {
+        info!("Запущен бенчмарк стратегий для сети...");
+        Some(auto_select_strategy(&dns).await)
+    } else {
+        match args.preset {
+            PresetArg::Auto => None, // None = Smart Adaptive Engine!
+            PresetArg::Rtk => Some(SplitStrategy::TlsRecordFrag),
+            PresetArg::Mobile => Some(SplitStrategy::Disorder1),
+            PresetArg::Ultra => Some(SplitStrategy::Combo),
         }
-        StrategyArg::None => SplitStrategy::None,
     };
 
-    info!("Активная стратегия десинхронизации: {:?}", strategy);
+    if let Some(strat) = fixed_strategy {
+        info!("Фиксированный режим десинхронизации: {:?}", strat);
+    } else {
+        info!("Режим: Smart Adaptive Engine (10 техник обхода, самообучение на лету)");
+    }
 
-    // Включаем системный прокси Windows (если не отключено флагом --no-sysproxy)
+    // Включаем системный прокси Windows
     let mut proxy_guard = if !args.no_sysproxy {
         Some(sysproxy::ProxyGuard::enable(&args.bind)?)
     } else {
@@ -123,16 +173,15 @@ async fn main() -> Result<()> {
         "Сервер Smoke готов к работе на http://{} и socks5://{}",
         args.bind, args.bind
     );
-    info!("Для остановки и восстановления настроек нажмите Ctrl + C (или закройте окно).");
+    info!("Для остановки нажмите Ctrl + C или закройте окно.");
 
-    // Страховка №3: корректно ловим Ctrl + C для чистого восстановления
+    // Страховка №3: ловим Ctrl + C
     tokio::select! {
-        res = smoke_core::socks5::run_server(bind_addr, dns, strategy) => {
+        res = smoke_core::socks5::run_server(bind_addr, dns, fixed_strategy) => {
             if let Err(e) = res {
                 tracing::error!("Ошибка работы сервера: {}", e);
                 eprintln!("\n[!] ОШИБКА: Не удалось запустить сервер на {}.", bind_addr);
-                eprintln!("    Возможно, порт 1080 уже занят другой копией Smoke или другим прокси.");
-                eprintln!("    Закройте предыдущую копию или укажите другой порт: smoke --bind 127.0.0.1:1081\n");
+                eprintln!("    Возможно, порт 1080 уже занят. Закройте предыдущую копию или укажите: smoke --bind 127.0.0.1:1081\n");
             }
         }
         _ = tokio::signal::ctrl_c() => {
@@ -147,8 +196,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Регистрирует низкоуровневый Win32 обработчик закрытия окна консоли [X],
-/// завершения сеанса пользователя или перезагрузки Windows
 #[cfg(target_os = "windows")]
 fn setup_console_close_handler() {
     #[link(name = "kernel32")]
@@ -160,9 +207,8 @@ fn setup_console_close_handler() {
     }
 
     unsafe extern "system" fn handler(_ctrl_type: u32) -> i32 {
-        // 0: CTRL_C, 1: CTRL_BREAK, 2: CTRL_CLOSE, 5: CTRL_LOGOFF, 6: CTRL_SHUTDOWN
         sysproxy::disable_raw();
-        0 // Возвращаем 0 (FALSE), чтобы Windows продолжила штатный выход
+        0
     }
 
     unsafe {

@@ -37,8 +37,12 @@ pub async fn auto_select_strategy(dns: &DnsResolver) -> SplitStrategy {
     let candidates = [
         ("TlsRecordFrag", SplitStrategy::TlsRecordFrag),
         ("TlsRecordFrag2", SplitStrategy::TlsRecordFrag2),
-        ("TlsRecordAndSni", SplitStrategy::TlsRecordAndSni),
-        ("SniMiddle(2)", SplitStrategy::SniMiddle { fallback_pos: 2 }),
+        ("Disorder1", SplitStrategy::Disorder1),
+        ("TcpSplitSni", SplitStrategy::TcpSplitSni),
+        ("OobSni", SplitStrategy::OobSni),
+        ("TlsRecordFragSni", SplitStrategy::TlsRecordFragSni),
+        ("Combo", SplitStrategy::Combo),
+        ("TcpSplit2", SplitStrategy::TcpSplit2),
     ];
 
     let client_hello = build_test_client_hello(test_domain);

@@ -1,3 +1,4 @@
+pub mod adaptive;
 pub mod desync;
 pub mod dns;
 pub mod error;

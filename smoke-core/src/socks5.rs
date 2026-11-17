@@ -1,8 +1,10 @@
-use crate::desync::{send_desync, SplitStrategy};
+use crate::adaptive::AdaptiveEngine;
+use crate::desync::{find_sni_range, send_desync, SplitStrategy};
 use crate::dns::DnsResolver;
 use crate::error::{Result, SmokeError};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -20,14 +22,22 @@ const ATYP_IPV6: u8 = 0x04;
 pub async fn run_server(
     bind_addr: SocketAddr,
     dns: DnsResolver,
-    strategy: SplitStrategy,
+    fixed_strategy: Option<SplitStrategy>,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
+    let engine = Arc::new(AdaptiveEngine::new());
 
-    info!(
-        "Smoke универсальный прокси (SOCKS5 + HTTP) запущен на {} | Режим: {:?}",
-        bind_addr, strategy
-    );
+    if let Some(strat) = fixed_strategy {
+        info!(
+            "Smoke универсальный прокси (SOCKS5 + HTTP) запущен на {} | Фиксированный режим: {:?}",
+            bind_addr, strat
+        );
+    } else {
+        info!(
+            "Smoke универсальный прокси (SOCKS5 + HTTP) запущен на {} | Режим: Smart Adaptive (автоподбор и самообучение на лету)",
+            bind_addr
+        );
+    }
 
     loop {
         let (client_stream, peer_addr) = match listener.accept().await {
@@ -40,9 +50,10 @@ pub async fn run_server(
 
         let _ = client_stream.set_nodelay(true);
         let dns_clone = dns.clone();
+        let engine_clone = engine.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(client_stream, dns_clone, strategy).await {
+            if let Err(e) = handle_connection(client_stream, dns_clone, engine_clone, fixed_strategy).await {
                 debug!("Сессия {} завершена: {}", peer_addr, e);
             }
         });
@@ -53,7 +64,8 @@ pub async fn run_server(
 async fn handle_connection(
     client: TcpStream,
     dns: DnsResolver,
-    strategy: SplitStrategy,
+    engine: Arc<AdaptiveEngine>,
+    fixed_strategy: Option<SplitStrategy>,
 ) -> Result<()> {
     let mut peek_buf = [0u8; 1];
     let n = client.peek(&mut peek_buf).await?;
@@ -62,16 +74,17 @@ async fn handle_connection(
     }
 
     if *peek_buf.first().unwrap_or(&0) == SOCKS_VERSION {
-        handle_socks5(client, dns, strategy).await
+        handle_socks5(client, dns, engine, fixed_strategy).await
     } else {
-        handle_http_proxy(client, dns, strategy).await
+        handle_http_proxy(client, dns, engine, fixed_strategy).await
     }
 }
 
 async fn handle_http_proxy(
     mut client: TcpStream,
     dns: DnsResolver,
-    strategy: SplitStrategy,
+    engine: Arc<AdaptiveEngine>,
+    fixed_strategy: Option<SplitStrategy>,
 ) -> Result<()> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 2048];
@@ -118,7 +131,7 @@ async fn handle_http_proxy(
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
 
-        relay_with_desync(client, remote, target_addr, strategy).await
+        relay_with_desync(client, remote, target_addr, &host, engine, fixed_strategy).await
     } else {
         // Обычный незашифрованный HTTP-запрос
         let host_line = req_str
@@ -134,7 +147,7 @@ async fn handle_http_proxy(
         let active_strategy = if is_private_ip(target_addr.ip()) {
             SplitStrategy::None
         } else {
-            strategy
+            fixed_strategy.unwrap_or_else(|| engine.get_strategy(&host))
         };
 
         send_desync(&mut remote, &buf, active_strategy).await?;
@@ -144,7 +157,6 @@ async fn handle_http_proxy(
 }
 
 fn parse_host_port(s: &str, default_port: u16) -> Result<(String, u16)> {
-    // Убираем протокольные префиксы, если передан абсолютный URI
     let clean = s
         .strip_prefix("http://")
         .or_else(|| s.strip_prefix("https://"))
@@ -165,7 +177,8 @@ fn parse_host_port(s: &str, default_port: u16) -> Result<(String, u16)> {
 async fn handle_socks5(
     mut client: TcpStream,
     dns: DnsResolver,
-    strategy: SplitStrategy,
+    engine: Arc<AdaptiveEngine>,
+    fixed_strategy: Option<SplitStrategy>,
 ) -> Result<()> {
     let mut header = [0u8; 2];
     client.read_exact(&mut header).await?;
@@ -198,12 +211,14 @@ async fn handle_socks5(
     }
 
     let atyp = *req_head.get(3).unwrap_or(&0);
-    let target_addr = match atyp {
+
+    let (target_addr, parsed_host) = match atyp {
         ATYP_IPV4 => {
             let mut ip_bytes = [0u8; 4];
             client.read_exact(&mut ip_bytes).await?;
             let port = client.read_u16().await?;
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip_bytes)), port)
+            let ip = Ipv4Addr::from(ip_bytes);
+            (SocketAddr::new(IpAddr::V4(ip), port), ip.to_string())
         }
         ATYP_DOMAIN => {
             let len = client.read_u8().await? as usize;
@@ -212,14 +227,16 @@ async fn handle_socks5(
             let domain =
                 std::str::from_utf8(&domain_bytes).map_err(|_| SmokeError::InvalidDomain)?;
             let port = client.read_u16().await?;
-
-            dns.resolve(domain, port).await?
+            let host_str = domain.to_string();
+            let addr = dns.resolve(domain, port).await?;
+            (addr, host_str)
         }
         ATYP_IPV6 => {
             let mut ip_bytes = [0u8; 16];
             client.read_exact(&mut ip_bytes).await?;
             let port = client.read_u16().await?;
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip_bytes)), port)
+            let ip = Ipv6Addr::from(ip_bytes);
+            (SocketAddr::new(IpAddr::V6(ip), port), ip.to_string())
         }
         other => return Err(SmokeError::UnsupportedAddressType(other)),
     };
@@ -237,39 +254,72 @@ async fn handle_socks5(
     let reply = [SOCKS_VERSION, 0x00, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
     client.write_all(&reply).await?;
 
-    relay_with_desync(client, remote, target_addr, strategy).await
+    relay_with_desync(client, remote, target_addr, &parsed_host, engine, fixed_strategy).await
 }
 
 async fn relay_with_desync(
     mut client: TcpStream,
     mut remote: TcpStream,
     target_addr: SocketAddr,
-    strategy: SplitStrategy,
+    host: &str,
+    engine: Arc<AdaptiveEngine>,
+    fixed_strategy: Option<SplitStrategy>,
 ) -> Result<()> {
+    let mut first_buf = [0u8; 16384];
+    let n = match timeout(Duration::from_secs(10), client.read(&mut first_buf)).await {
+        Ok(Ok(0)) => return Ok(()),
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(SmokeError::Io(e)),
+        Err(_) => return Ok(()),
+    };
+
+    let slice = &first_buf[..n];
+
+    // Извлекаем точный SNI из TLS ClientHello (если есть), чтобы знать истинный домен даже при запросах по IP
+    let resolved_host = if let Some(sni_info) = find_sni_range(slice) {
+        if let Some(sni_bytes) = slice.get(sni_info.start..sni_info.end) {
+            std::str::from_utf8(sni_bytes).unwrap_or(host)
+        } else {
+            host
+        }
+    } else {
+        host
+    };
+
     let active_strategy = if is_private_ip(target_addr.ip()) {
         SplitStrategy::None
     } else {
-        strategy
+        fixed_strategy.unwrap_or_else(|| engine.get_strategy(resolved_host))
     };
 
-    let mut first_buf = [0u8; 16384];
-    // Ожидаем первый пакет от клиента с надежным таймаутом (до 10 секунд)
-    match timeout(Duration::from_secs(10), client.read(&mut first_buf)).await {
-        Ok(Ok(0)) => return Ok(()),
-        Ok(Ok(n)) => {
-            if let Some(slice) = first_buf.get(..n) {
-                send_desync(&mut remote, slice, active_strategy).await?;
+    send_desync(&mut remote, slice, active_strategy).await?;
+
+    // Проверяем первый байт ответа от сервера с таймаутом 2.5 сек:
+    // Если сервер прислал ответ — стратегия подтверждена и закрепляется!
+    // Если сервер сбросил соединение (ТСПУ послал RST) или завис — адаптивно переключаем стратегию на лету!
+    let mut resp_first = [0u8; 1];
+    match timeout(Duration::from_millis(2500), remote.read(&mut resp_first)).await {
+        Ok(Ok(n)) if n > 0 => {
+            if fixed_strategy.is_none() {
+                engine.record_success(resolved_host, active_strategy);
             }
+            client.write_all(&resp_first[..n]).await?;
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
+            Ok(())
         }
-        Ok(Err(e)) => return Err(SmokeError::Io(e)),
-        Err(_) => {
-            // Клиент подключился, но ничего не прислал за 10 секунд
-            return Ok(());
+        Ok(Ok(_)) | Err(_) => {
+            if fixed_strategy.is_none() {
+                engine.record_failure(resolved_host, active_strategy);
+            }
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            if fixed_strategy.is_none() {
+                engine.record_failure(resolved_host, active_strategy);
+            }
+            Err(SmokeError::Io(e))
         }
     }
-
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
-    Ok(())
 }
 
 fn is_private_ip(ip: IpAddr) -> bool {
