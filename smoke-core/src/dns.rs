@@ -18,18 +18,14 @@ impl DnsResolver {
     pub fn new_doh() -> Self {
         let mut opts = ResolverOpts::default();
         opts.cache_size = 4096;
-        opts.timeout = Duration::from_millis(1500);
+        opts.timeout = Duration::from_millis(800);
         opts.attempts = 1;
         opts.use_hosts_file = true;
         opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4Only;
 
-        // Основной шифрованный канал: Google DoH (8.8.8.8 / 8.8.4.4)
+        // Основные каналы: Google DoH и Cloudflare DoH
         let doh_google = TokioAsyncResolver::tokio(ResolverConfig::google_https(), opts.clone());
-
-        // Второй шифрованный канал: Cloudflare DoH (1.1.1.1 / 1.0.0.1)
         let doh_cloudflare = TokioAsyncResolver::tokio(ResolverConfig::cloudflare_https(), opts.clone());
-
-        // Резервный шифрованный канал: Quad9 DoH (9.9.9.9)
         let doh_quad9 = TokioAsyncResolver::tokio(ResolverConfig::quad9_https(), opts);
 
         Self {
@@ -44,26 +40,43 @@ impl DnsResolver {
             return Ok(SocketAddr::new(ip, port));
         }
 
-        // 1. Пытаемся через Google DoH
-        if let Some(ip) = Self::try_lookup(&self.doh_google, domain).await {
-            debug!("Google DoH: {} -> {}", domain, ip);
+        // Параллельная гонка между Google DoH и Cloudflare DoH:
+        // Если провайдер замедляет или блокирует один из них — второй отвечает за считанные миллисекунды!
+        let g_res = self.doh_google.clone();
+        let c_res = self.doh_cloudflare.clone();
+        let d1 = domain.to_string();
+        let d2 = domain.to_string();
+
+        let race_fut = async {
+            tokio::select! {
+                res_g = Self::try_lookup(&g_res, &d1) => {
+                    if let Some(ip) = res_g {
+                        return Some(ip);
+                    }
+                    Self::try_lookup(&c_res, &d1).await
+                }
+                res_c = Self::try_lookup(&c_res, &d2) => {
+                    if let Some(ip) = res_c {
+                        return Some(ip);
+                    }
+                    Self::try_lookup(&g_res, &d2).await
+                }
+            }
+        };
+
+        if let Ok(Some(ip)) = tokio::time::timeout(Duration::from_millis(1200), race_fut).await {
+            debug!("DoH Fast-Race: {} -> {}", domain, ip);
             return Ok(SocketAddr::new(ip, port));
         }
 
-        // 2. Если Google DoH блокируется — пробуем Cloudflare DoH
-        if let Some(ip) = Self::try_lookup(&self.doh_cloudflare, domain).await {
-            debug!("Cloudflare DoH: {} -> {}", domain, ip);
-            return Ok(SocketAddr::new(ip, port));
-        }
-
-        // 3. Если Cloudflare тоже недоступен — пробуем Quad9 DoH
+        // Резерв 1: Quad9 DoH (если Google и Cloudflare одновременно недоступны)
         if let Some(ip) = Self::try_lookup(&self.doh_quad9, domain).await {
             debug!("Quad9 DoH: {} -> {}", domain, ip);
             return Ok(SocketAddr::new(ip, port));
         }
 
-        // 4. Резерв через системный резолвер (чтобы связь не обрывалась)
-        warn!("Все DoH недоступны для {}, используем системный DNS", domain);
+        // Резерв 2: Системный резолвер (чтобы интернет никогда не падал)
+        warn!("DoH недоступен для {}, используем системный DNS", domain);
         let addr = lookup_host((domain, port))
             .await
             .map_err(SmokeError::Io)?

@@ -20,8 +20,8 @@ struct Args {
     #[arg(short, long, default_value = "127.0.0.1:1080")]
     bind: String,
 
-    /// Стратегия десинхронизации
-    #[arg(short, long, value_enum, default_value = "auto")]
+    /// Стратегия десинхронизации (по умолчанию: tls-record-frag для мгновенного старта)
+    #[arg(short, long, value_enum, default_value = "tls-record-frag")]
     strategy: StrategyArg,
 
     /// Не включать системный прокси Windows (для ручной настройки в приложениях)
@@ -35,8 +35,6 @@ struct Args {
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum StrategyArg {
-    /// Автоматический подбор лучшей стратегии для вашей сети
-    Auto,
     /// Фрагментация TLS Record Layer (разбиение на 3-4 рекорда, максимальная пробиваемость)
     TlsRecordFrag,
     /// Двухзвенная фрагментация TLS Record Layer (1 байт в первом рекорде, максимальная совместимость)
@@ -45,6 +43,8 @@ enum StrategyArg {
     TlsRecord,
     /// Одинарный TCP-сплит посередине SNI
     SniMiddle,
+    /// Автоматический подбор стратегии через предварительный зонд сети
+    Auto,
     /// Без обработки (для диагностики)
     None,
 }
@@ -81,12 +81,16 @@ async fn main() -> Result<()> {
     let bind_addr: SocketAddr = args.bind.parse()?;
     let dns = DnsResolver::new_doh();
 
+    // Для мгновенного старта без задержек по умолчанию используем TlsRecordFrag
     let strategy = match args.strategy {
-        StrategyArg::Auto => auto_select_strategy(&dns).await,
         StrategyArg::TlsRecordFrag => SplitStrategy::TlsRecordFrag,
         StrategyArg::TlsRecordFrag2 => SplitStrategy::TlsRecordFrag2,
         StrategyArg::TlsRecord => SplitStrategy::TlsRecordAndSni,
         StrategyArg::SniMiddle => SplitStrategy::SniMiddle { fallback_pos: 2 },
+        StrategyArg::Auto => {
+            info!("Запущен автоподбор стратегии для сети...");
+            auto_select_strategy(&dns).await
+        }
         StrategyArg::None => SplitStrategy::None,
     };
 
@@ -111,6 +115,9 @@ async fn main() -> Result<()> {
         res = smoke_core::socks5::run_server(bind_addr, dns, strategy) => {
             if let Err(e) = res {
                 tracing::error!("Ошибка работы сервера: {}", e);
+                eprintln!("\n[!] ОШИБКА: Не удалось запустить сервер на {}.", bind_addr);
+                eprintln!("    Возможно, порт 1080 уже занят другой копией Smoke или другим прокси.");
+                eprintln!("    Закройте предыдущую копию или укажите другой порт: smoke --bind 127.0.0.1:1081\n");
             }
         }
         _ = tokio::signal::ctrl_c() => {

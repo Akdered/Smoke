@@ -296,7 +296,18 @@ async fn connect_optimized(addr: SocketAddr) -> std::io::Result<TcpStream> {
     let std_stream: std::net::TcpStream = socket.into();
     let tokio_stream = TcpStream::from_std(std_stream)?;
 
-    tokio_stream.writable().await?;
+    // Ограничиваем ожидание соединения 3 секундами для быстрого сброса мёртвых IP
+    match timeout(Duration::from_millis(3000), tokio_stream.writable()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Таймаут TCP подключения к удаленному узлу",
+            ))
+        }
+    }
+
     if let Some(err) = tokio_stream.take_error()? {
         return Err(err);
     }
