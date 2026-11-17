@@ -13,20 +13,16 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "smoke",
     about = "Высокоскоростной DPI-bypass прокси для Windows",
-    version = "0.2.0"
+    version = "0.3.0"
 )]
 struct Args {
     /// Адрес и порт для запуска прокси
     #[arg(short, long, default_value = "127.0.0.1:1080")]
     bind: String,
 
-    /// Стратегия десинхронизации (auto, tls-record, sni-middle, fake-ttl, none)
+    /// Стратегия десинхронизации
     #[arg(short, long, value_enum, default_value = "auto")]
     strategy: StrategyArg,
-
-    /// TTL для стратегии fake-ttl (по умолчанию 3)
-    #[arg(long, default_value = "3")]
-    fake_ttl: u32,
 
     /// Не включать системный прокси Windows (для ручной настройки в приложениях)
     #[arg(long)]
@@ -39,10 +35,17 @@ struct Args {
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum StrategyArg {
+    /// Автоматический подбор лучшей стратегии для вашей сети
     Auto,
+    /// Фрагментация TLS Record Layer (разбиение на 3-4 рекорда, максимальная пробиваемость)
+    TlsRecordFrag,
+    /// Двухзвенная фрагментация TLS Record Layer (1 байт в первом рекорде, максимальная совместимость)
+    TlsRecordFrag2,
+    /// Двойной TCP-сплит: по заголовку TLS Record + по SNI
     TlsRecord,
+    /// Одинарный TCP-сплит посередине SNI
     SniMiddle,
-    FakeTtl,
+    /// Без обработки (для диагностики)
     None,
 }
 
@@ -71,7 +74,7 @@ async fn main() -> Result<()> {
   \__ \ / __ `__ \ / __ \  / //_// _ \   
  ___/ // / / / / // /_/ / / ,<  /  __/   
 /____//_/ /_/ /_/ \____/ /_/|_| \___/    
-    High-Performance DPI Bypass Engine v0.2.0
+    High-Performance DPI Bypass Engine v0.3.0
 "#
     );
 
@@ -80,12 +83,10 @@ async fn main() -> Result<()> {
 
     let strategy = match args.strategy {
         StrategyArg::Auto => auto_select_strategy(&dns).await,
+        StrategyArg::TlsRecordFrag => SplitStrategy::TlsRecordFrag,
+        StrategyArg::TlsRecordFrag2 => SplitStrategy::TlsRecordFrag2,
         StrategyArg::TlsRecord => SplitStrategy::TlsRecordAndSni,
         StrategyArg::SniMiddle => SplitStrategy::SniMiddle { fallback_pos: 2 },
-        StrategyArg::FakeTtl => SplitStrategy::FakeTtl {
-            fake_ttl: args.fake_ttl,
-            fallback_pos: 2,
-        },
         StrategyArg::None => SplitStrategy::None,
     };
 

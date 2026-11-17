@@ -21,6 +21,7 @@ impl DnsResolver {
         opts.timeout = Duration::from_millis(1500);
         opts.attempts = 1;
         opts.use_hosts_file = true;
+        opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4Only;
 
         // Основной шифрованный канал: Google DoH (8.8.8.8 / 8.8.4.4)
         let doh_google = TokioAsyncResolver::tokio(ResolverConfig::google_https(), opts.clone());
