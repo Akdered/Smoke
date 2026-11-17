@@ -2,3 +2,7 @@
 **/*.rs.bk
 *.pdb
 *.exe
+.idea/
+.vscode/
+*.swp
+
