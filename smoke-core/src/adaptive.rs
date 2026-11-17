@@ -39,18 +39,39 @@ pub const DISCORD_STRATEGIES: &[SplitStrategy] = &[
     SplitStrategy::TcpSplit1,
 ];
 
-/// Интеллектуальный самообучающийся движок с автосохранением на диск:
+/// Интеллектуальный самообучающийся движок с автосохранением на диск и защитой от флаппинга (Hysteresis):
 /// Автоматически подбирает, закрепляет и сохраняет рабочие стратегии для каждого семейства доменов.
 #[derive(Debug)]
 pub struct AdaptiveEngine {
     domain_cache: RwLock<HashMap<String, usize>>,
+    failure_counters: RwLock<HashMap<String, u32>>,
+    confirmed_domains: RwLock<HashMap<String, bool>>,
+    persistent: bool,
 }
 
 impl AdaptiveEngine {
     pub fn new() -> Self {
         let initial_cache = load_cache_from_disk();
+        let mut confirmed = HashMap::new();
+        for key in initial_cache.keys() {
+            confirmed.insert(key.clone(), true);
+        }
+
         Self {
             domain_cache: RwLock::new(initial_cache),
+            failure_counters: RwLock::new(HashMap::new()),
+            confirmed_domains: RwLock::new(confirmed),
+            persistent: true,
+        }
+    }
+
+    /// Конструктор для тестов без обращения к диску
+    pub fn new_in_memory() -> Self {
+        Self {
+            domain_cache: RwLock::new(HashMap::new()),
+            failure_counters: RwLock::new(HashMap::new()),
+            confirmed_domains: RwLock::new(HashMap::new()),
+            persistent: false,
         }
     }
 
@@ -81,21 +102,55 @@ impl AdaptiveEngine {
         let family = extract_family_domain(domain);
         let strategies = Self::get_strategies_for(domain);
         if let Some(idx) = strategies.iter().position(|&s| s == strategy) {
+            if let Ok(mut counters) = self.failure_counters.write() {
+                counters.insert(family.clone(), 0);
+            }
+            if let Ok(mut confirmed) = self.confirmed_domains.write() {
+                confirmed.insert(family.clone(), true);
+            }
+
             let mut cache = self.domain_cache.write().unwrap();
             let prev = cache.insert(family.clone(), idx);
             if prev != Some(idx) {
                 info!("✓ Стратегия {:?} закреплена как успешная для {}", strategy, family);
-                save_cache_to_disk(&cache);
+                if self.persistent {
+                    save_cache_to_disk(&cache);
+                }
             } else {
                 debug!("Стратегия {:?} подтверждена для {}", strategy, family);
             }
         }
     }
 
-    /// Реагирует на сброс/таймаут ТСПУ: переключает домен на следующую стратегию из арсенала
+    /// Реагирует на сброс/таймаут: переключает стратегию только при подтвержденных сбоях (защита от флаппинга)
     pub fn record_failure(&self, domain: &str, failed_strategy: SplitStrategy) -> SplitStrategy {
         let family = extract_family_domain(domain);
         let strategies = Self::get_strategies_for(domain);
+
+        let is_confirmed = self
+            .confirmed_domains
+            .read()
+            .unwrap()
+            .get(&family)
+            .copied()
+            .unwrap_or(false);
+
+        let mut counters = self.failure_counters.write().unwrap();
+        let count = counters.entry(family.clone()).or_insert(0);
+        *count += 1;
+
+        // Если домен уже был подтвержден рабочим (например, ютуб играет),
+        // один спорадический сбой (закрытая вкладка, заблокированный adblocker'ом баннер) не должен переключать стратегию!
+        if is_confirmed && *count < 2 {
+            debug!(
+                "Спорадический сбой для {} ({}/2). Сохраняем проверенную стратегию {:?}",
+                family, *count, failed_strategy
+            );
+            return failed_strategy;
+        }
+
+        // Порог превышен: действительно произошла блокировка ТСПУ
+        *count = 0;
         let mut cache = self.domain_cache.write().unwrap();
         let cur_idx = cache.get(&family).copied().unwrap_or(0);
         let next_idx = (cur_idx + 1) % strategies.len();
@@ -210,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_discord_strategies_priority() {
-        let engine = AdaptiveEngine::new();
+        let engine = AdaptiveEngine::new_in_memory();
         let strat = engine.get_strategy("discord.com");
         assert_eq!(strat, SplitStrategy::Disorder1);
 
@@ -220,16 +275,27 @@ mod tests {
 
     #[test]
     fn test_adaptive_failover() {
-        let engine = AdaptiveEngine::new();
+        let engine = AdaptiveEngine::new_in_memory();
         let d = "example.com";
         let s0 = engine.get_strategy(d);
         assert_eq!(s0, DEFAULT_STRATEGIES[0]);
 
+        // Для нового (неподтвержденного) домена первое же падение переключает стратегию
         let s1 = engine.record_failure(d, s0);
         assert_eq!(s1, DEFAULT_STRATEGIES[1]);
         assert_eq!(engine.get_strategy(d), DEFAULT_STRATEGIES[1]);
 
         engine.record_success(d, s1);
         assert_eq!(engine.get_strategy(d), DEFAULT_STRATEGIES[1]);
+
+        // Для подтвержденного домена 1 спорадический сбой сохраняет рабочую стратегию
+        let s_stay = engine.record_failure(d, s1);
+        assert_eq!(s_stay, s1);
+        assert_eq!(engine.get_strategy(d), s1);
+
+        // 2-й сбой подряд подтверждает блокировку и переключает
+        let s2 = engine.record_failure(d, s1);
+        assert_eq!(s2, DEFAULT_STRATEGIES[2]);
+        assert_eq!(engine.get_strategy(d), DEFAULT_STRATEGIES[2]);
     }
 }
