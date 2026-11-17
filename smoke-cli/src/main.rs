@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "smoke",
     about = "Высокоскоростной DPI-bypass прокси для Windows",
-    version = "0.4.0"
+    version = "0.4.1"
 )]
 struct Args {
     /// Адрес и порт для запуска прокси
@@ -53,6 +53,8 @@ enum PresetArg {
     Rtk,
     /// Пресет для мобильных операторов МТС/Билайн/Мегафон (Disorder1)
     Mobile,
+    /// Пресет для Discord (Disorder1)
+    Discord,
     /// Ультимативный комбо-режим против жестких ТСПУ (Combo)
     Ultra,
 }
@@ -119,7 +121,7 @@ async fn main() -> Result<()> {
  ___/ // / / / / // /_/ / / ,<  /  __/   
 /____//_/ /_/ /_/ \____/ /_/|_| \___/    
              by Akdered
-    High-Performance DPI Bypass Engine v0.4.0
+    High-Performance DPI Bypass Engine v0.4.1
 "#
     );
 
@@ -151,6 +153,7 @@ async fn main() -> Result<()> {
             PresetArg::Auto => None, // None = Smart Adaptive Engine!
             PresetArg::Rtk => Some(SplitStrategy::TlsRecordFrag),
             PresetArg::Mobile => Some(SplitStrategy::Disorder1),
+            PresetArg::Discord => Some(SplitStrategy::Disorder1),
             PresetArg::Ultra => Some(SplitStrategy::Combo),
         }
     };

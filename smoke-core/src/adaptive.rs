@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use tracing::{debug, info};
 
+/// Базовый порядок стратегий для большинства веб-сайтов (YouTube, Google CDN, обычные сайты)
 pub const DEFAULT_STRATEGIES: &[SplitStrategy] = &[
     SplitStrategy::TlsRecordFrag,
     SplitStrategy::TlsRecordFrag2,
@@ -12,6 +13,21 @@ pub const DEFAULT_STRATEGIES: &[SplitStrategy] = &[
     SplitStrategy::TlsRecordFragSni,
     SplitStrategy::DisorderSni,
     SplitStrategy::Combo,
+    SplitStrategy::TcpSplit2,
+    SplitStrategy::TcpSplit1,
+];
+
+/// Специализированный порядок стратегий для Discord (API, Gateway, CDN, Updates):
+/// По статистике Zapret/ByeDPI в РФ, Disorder1 (TTL=1 + SACK) пробивает блокировки Discord в 95%+ случаев!
+pub const DISCORD_STRATEGIES: &[SplitStrategy] = &[
+    SplitStrategy::Disorder1,
+    SplitStrategy::TlsRecordFrag2,
+    SplitStrategy::TcpSplitSni,
+    SplitStrategy::Combo,
+    SplitStrategy::DisorderSni,
+    SplitStrategy::OobSni,
+    SplitStrategy::TlsRecordFrag,
+    SplitStrategy::TlsRecordFragSni,
     SplitStrategy::TcpSplit2,
     SplitStrategy::TcpSplit1,
 ];
@@ -31,39 +47,55 @@ impl AdaptiveEngine {
         }
     }
 
+    pub fn is_discord_family(domain: &str) -> bool {
+        let clean = domain.split(':').next().unwrap_or(domain).trim().to_ascii_lowercase();
+        clean.contains("discord") || clean == "dis.gd"
+    }
+
+    pub fn get_strategies_for(domain: &str) -> &'static [SplitStrategy] {
+        if Self::is_discord_family(domain) {
+            DISCORD_STRATEGIES
+        } else {
+            DEFAULT_STRATEGIES
+        }
+    }
+
     /// Получает текущую лучшую стратегию для указанного домена
     pub fn get_strategy(&self, domain: &str) -> SplitStrategy {
-        let base = extract_base_domain(domain);
+        let family = extract_family_domain(domain);
+        let strategies = Self::get_strategies_for(domain);
         let cache = self.domain_cache.read().unwrap();
-        let idx = cache.get(base).copied().unwrap_or(0);
-        DEFAULT_STRATEGIES.get(idx).copied().unwrap_or(SplitStrategy::TlsRecordFrag)
+        let idx = cache.get(&family).copied().unwrap_or(0);
+        strategies.get(idx).copied().unwrap_or(strategies[0])
     }
 
     /// Закрепляет успешную стратегию при подтвержденном ответе от сервера
     pub fn record_success(&self, domain: &str, strategy: SplitStrategy) {
-        let base = extract_base_domain(domain);
-        if let Some(idx) = DEFAULT_STRATEGIES.iter().position(|&s| s == strategy) {
+        let family = extract_family_domain(domain);
+        let strategies = Self::get_strategies_for(domain);
+        if let Some(idx) = strategies.iter().position(|&s| s == strategy) {
             let mut cache = self.domain_cache.write().unwrap();
-            let prev = cache.insert(base.to_string(), idx);
+            let prev = cache.insert(family.clone(), idx);
             if prev != Some(idx) {
-                info!("✓ Стратегия {:?} закреплена как успешная для {}", strategy, base);
+                info!("✓ Стратегия {:?} закреплена как успешная для {}", strategy, family);
             } else {
-                debug!("Стратегия {:?} подтверждена для {}", strategy, base);
+                debug!("Стратегия {:?} подтверждена для {}", strategy, family);
             }
         }
     }
 
     /// Реагирует на сброс/таймаут ТСПУ: переключает домен на следующую стратегию из арсенала
     pub fn record_failure(&self, domain: &str, failed_strategy: SplitStrategy) -> SplitStrategy {
-        let base = extract_base_domain(domain);
+        let family = extract_family_domain(domain);
+        let strategies = Self::get_strategies_for(domain);
         let mut cache = self.domain_cache.write().unwrap();
-        let cur_idx = cache.get(base).copied().unwrap_or(0);
-        let next_idx = (cur_idx + 1) % DEFAULT_STRATEGIES.len();
-        cache.insert(base.to_string(), next_idx);
-        let next_strat = DEFAULT_STRATEGIES[next_idx];
+        let cur_idx = cache.get(&family).copied().unwrap_or(0);
+        let next_idx = (cur_idx + 1) % strategies.len();
+        cache.insert(family.clone(), next_idx);
+        let next_strat = strategies[next_idx];
         info!(
             "⚡ ТСПУ заблокировал {:?} для {}. Адаптивно переключаем на -> {:?}",
-            failed_strategy, base, next_strat
+            failed_strategy, family, next_strat
         );
         next_strat
     }
@@ -73,6 +105,28 @@ impl Default for AdaptiveEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Выделяет семейство домена для сквозной оптимизации связанных сервисов
+pub fn extract_family_domain(host: &str) -> String {
+    let clean = host.split(':').next().unwrap_or(host).trim().to_ascii_lowercase();
+
+    // Семейство Discord (gateway, cdn, updates, voice, dl2)
+    if clean.contains("discord") || clean == "dis.gd" {
+        return "discord_family".to_string();
+    }
+
+    // Семейство Google / YouTube
+    if clean.contains("youtube")
+        || clean.contains("googlevideo")
+        || clean.contains("ytimg")
+        || clean.contains("ggpht")
+        || clean == "youtu.be"
+    {
+        return "youtube_family".to_string();
+    }
+
+    extract_base_domain(&clean).to_string()
 }
 
 /// Выделяет базовый домен (например, "rr3---sn-4g5lzney.googlevideo.com" -> "googlevideo.com")
@@ -103,9 +157,31 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_family_domain() {
+        assert_eq!(extract_family_domain("www.youtube.com"), "youtube_family");
+        assert_eq!(extract_family_domain("rr1---sn-4g5edn6s.googlevideo.com:443"), "youtube_family");
+        assert_eq!(extract_family_domain("i.ytimg.com"), "youtube_family");
+        assert_eq!(extract_family_domain("discord.com"), "discord_family");
+        assert_eq!(extract_family_domain("gateway.discord.gg"), "discord_family");
+        assert_eq!(extract_family_domain("cdn.discordapp.com"), "discord_family");
+        assert_eq!(extract_family_domain("updates.discord.com"), "discord_family");
+        assert_eq!(extract_family_domain("example.com"), "example.com");
+    }
+
+    #[test]
+    fn test_discord_strategies_priority() {
+        let engine = AdaptiveEngine::new();
+        let strat = engine.get_strategy("discord.com");
+        assert_eq!(strat, SplitStrategy::Disorder1);
+
+        let strat_yt = engine.get_strategy("youtube.com");
+        assert_eq!(strat_yt, SplitStrategy::TlsRecordFrag);
+    }
+
+    #[test]
     fn test_adaptive_failover() {
         let engine = AdaptiveEngine::new();
-        let d = "googlevideo.com";
+        let d = "example.com";
         let s0 = engine.get_strategy(d);
         assert_eq!(s0, DEFAULT_STRATEGIES[0]);
 

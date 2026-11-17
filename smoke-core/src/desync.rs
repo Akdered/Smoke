@@ -460,7 +460,7 @@ fn compute_record_split_points(full_buf: &[u8], payload_len: usize) -> Vec<usize
 }
 
 #[inline]
-fn is_tls_handshake(buf: &[u8]) -> bool {
+pub fn is_tls_handshake(buf: &[u8]) -> bool {
     buf.len() >= 6 && buf[0] == 0x16 && buf[1] == 0x03
 }
 

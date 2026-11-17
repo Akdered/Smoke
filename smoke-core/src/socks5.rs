@@ -1,5 +1,5 @@
 use crate::adaptive::AdaptiveEngine;
-use crate::desync::{find_sni_range, send_desync, SplitStrategy};
+use crate::desync::{find_sni_range, is_tls_handshake, send_desync, SplitStrategy};
 use crate::dns::DnsResolver;
 use crate::error::{Result, SmokeError};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -131,7 +131,8 @@ async fn handle_http_proxy(
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
 
-        relay_with_desync(client, remote, target_addr, &host, engine, fixed_strategy).await
+        let leftover = &buf[header_end..];
+        relay_with_desync(client, remote, target_addr, &host, engine, fixed_strategy, leftover).await
     } else {
         // Обычный незашифрованный HTTP-запрос
         let host_line = req_str
@@ -254,7 +255,7 @@ async fn handle_socks5(
     let reply = [SOCKS_VERSION, 0x00, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
     client.write_all(&reply).await?;
 
-    relay_with_desync(client, remote, target_addr, &parsed_host, engine, fixed_strategy).await
+    relay_with_desync(client, remote, target_addr, &parsed_host, engine, fixed_strategy, &[]).await
 }
 
 async fn relay_with_desync(
@@ -264,13 +265,20 @@ async fn relay_with_desync(
     host: &str,
     engine: Arc<AdaptiveEngine>,
     fixed_strategy: Option<SplitStrategy>,
+    leftover_data: &[u8],
 ) -> Result<()> {
     let mut first_buf = [0u8; 16384];
-    let n = match timeout(Duration::from_secs(10), client.read(&mut first_buf)).await {
-        Ok(Ok(0)) => return Ok(()),
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => return Err(SmokeError::Io(e)),
-        Err(_) => return Ok(()),
+    let n = if !leftover_data.is_empty() {
+        let copy_len = leftover_data.len().min(first_buf.len());
+        first_buf[..copy_len].copy_from_slice(&leftover_data[..copy_len]);
+        copy_len
+    } else {
+        match timeout(Duration::from_secs(10), client.read(&mut first_buf)).await {
+            Ok(Ok(0)) => return Ok(()),
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(SmokeError::Io(e)),
+            Err(_) => return Ok(()),
+        }
     };
 
     let slice = &first_buf[..n];
@@ -286,40 +294,80 @@ async fn relay_with_desync(
         host
     };
 
-    let active_strategy = if is_private_ip(target_addr.ip()) {
-        SplitStrategy::None
-    } else {
-        fixed_strategy.unwrap_or_else(|| engine.get_strategy(resolved_host))
-    };
+    let is_private = is_private_ip(target_addr.ip());
+    let is_tls = is_tls_handshake(slice);
 
-    send_desync(&mut remote, slice, active_strategy).await?;
+    // Если стратегия жестко зафиксирована ключом CLI или IP локальный или не TLS:
+    if fixed_strategy.is_some() || is_private || !is_tls {
+        let active_strategy = if is_private {
+            SplitStrategy::None
+        } else {
+            fixed_strategy.unwrap_or_else(|| engine.get_strategy(resolved_host))
+        };
 
-    // Проверяем первый байт ответа от сервера с таймаутом 2.5 сек:
-    // Если сервер прислал ответ — стратегия подтверждена и закрепляется!
-    // Если сервер сбросил соединение (ТСПУ послал RST) или завис — адаптивно переключаем стратегию на лету!
-    let mut resp_first = [0u8; 1];
-    match timeout(Duration::from_millis(2500), remote.read(&mut resp_first)).await {
-        Ok(Ok(n)) if n > 0 => {
-            if fixed_strategy.is_none() {
+        send_desync(&mut remote, slice, active_strategy).await?;
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
+        return Ok(());
+    }
+
+    // Smart In-Flight Fast Failover:
+    // Если первая стратегия заблокирована ТСПУ (RST или таймаут 1200 мс),
+    // мы НЕ закрываем соединение клиента (Discord / браузера)!
+    // Мы на лету открываем новый сокет к серверу, берем следующую стратегию из арсенала и шлем ClientHello снова.
+    // Клиент получает ServerHello без ошибок обновления и без разрывов связи!
+    let max_attempts = 4;
+    let mut current_remote = Some(remote);
+
+    for attempt in 0..max_attempts {
+        let active_strategy = engine.get_strategy(resolved_host);
+        let mut stream = match current_remote.take() {
+            Some(s) => s,
+            None => match connect_optimized(target_addr).await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("Не удалось переподключиться к {}: {}", target_addr, e);
+                    return Err(SmokeError::Io(e));
+                }
+            },
+        };
+
+        if let Err(e) = send_desync(&mut stream, slice, active_strategy).await {
+            debug!("Ошибка send_desync ({:?}): {}", active_strategy, e);
+            engine.record_failure(resolved_host, active_strategy);
+            continue;
+        }
+
+        let mut resp_first = [0u8; 1];
+        match timeout(Duration::from_millis(1200), stream.read(&mut resp_first)).await {
+            Ok(Ok(n)) if n > 0 => {
                 engine.record_success(resolved_host, active_strategy);
+                client.write_all(&resp_first[..n]).await?;
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut stream).await;
+                return Ok(());
             }
-            client.write_all(&resp_first[..n]).await?;
-            let _ = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
-            Ok(())
-        }
-        Ok(Ok(_)) | Err(_) => {
-            if fixed_strategy.is_none() {
+            Ok(Ok(_)) | Err(_) => {
+                debug!(
+                    "Попытка {}/{} ({:?}) заблокирована ТСПУ для {}",
+                    attempt + 1,
+                    max_attempts,
+                    active_strategy,
+                    resolved_host
+                );
                 engine.record_failure(resolved_host, active_strategy);
             }
-            Ok(())
-        }
-        Ok(Err(e)) => {
-            if fixed_strategy.is_none() {
+            Ok(Err(e)) => {
+                debug!(
+                    "Ошибка сокета на попытке {} ({:?}): {}",
+                    attempt + 1,
+                    active_strategy,
+                    e
+                );
                 engine.record_failure(resolved_host, active_strategy);
             }
-            Err(SmokeError::Io(e))
         }
     }
+
+    Ok(())
 }
 
 fn is_private_ip(ip: IpAddr) -> bool {
