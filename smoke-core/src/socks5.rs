@@ -117,10 +117,10 @@ async fn handle_http_proxy(
     if method.eq_ignore_ascii_case("CONNECT") {
         // HTTPS туннель (например, CONNECT youtube.com:443 HTTP/1.1)
         let (host, port) = parse_host_port(target, 443)?;
-        let target_addr = dns.resolve(&host, port).await?;
+        let target_addrs = dns.resolve_all(&host, port).await?;
 
-        let remote = match connect_optimized(target_addr).await {
-            Ok(stream) => stream,
+        let (remote, connected_addr) = match connect_any_optimized(&target_addrs).await {
+            Ok(res) => res,
             Err(e) => {
                 let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 return Err(SmokeError::Io(e));
@@ -132,7 +132,17 @@ async fn handle_http_proxy(
             .await?;
 
         let leftover = &buf[header_end..];
-        relay_with_desync(client, remote, target_addr, &host, engine, fixed_strategy, leftover).await
+        relay_with_desync(
+            client,
+            remote,
+            connected_addr,
+            &target_addrs,
+            &host,
+            engine,
+            fixed_strategy,
+            leftover,
+        )
+        .await
     } else {
         // Обычный незашифрованный HTTP-запрос
         let host_line = req_str
@@ -142,10 +152,10 @@ async fn handle_http_proxy(
 
         let host_val = host_line.get(5..).unwrap_or("").trim();
         let (host, port) = parse_host_port(host_val, 80)?;
-        let target_addr = dns.resolve(&host, port).await?;
+        let target_addrs = dns.resolve_all(&host, port).await?;
 
-        let mut remote = connect_optimized(target_addr).await?;
-        let active_strategy = if is_private_ip(target_addr.ip()) {
+        let (mut remote, connected_addr) = connect_any_optimized(&target_addrs).await?;
+        let active_strategy = if is_private_ip(connected_addr.ip()) {
             SplitStrategy::None
         } else {
             fixed_strategy.unwrap_or_else(|| engine.get_strategy(&host))
@@ -213,13 +223,13 @@ async fn handle_socks5(
 
     let atyp = *req_head.get(3).unwrap_or(&0);
 
-    let (target_addr, parsed_host) = match atyp {
+    let (target_addrs, parsed_host) = match atyp {
         ATYP_IPV4 => {
             let mut ip_bytes = [0u8; 4];
             client.read_exact(&mut ip_bytes).await?;
             let port = client.read_u16().await?;
             let ip = Ipv4Addr::from(ip_bytes);
-            (SocketAddr::new(IpAddr::V4(ip), port), ip.to_string())
+            (vec![SocketAddr::new(IpAddr::V4(ip), port)], ip.to_string())
         }
         ATYP_DOMAIN => {
             let len = client.read_u8().await? as usize;
@@ -229,21 +239,21 @@ async fn handle_socks5(
                 std::str::from_utf8(&domain_bytes).map_err(|_| SmokeError::InvalidDomain)?;
             let port = client.read_u16().await?;
             let host_str = domain.to_string();
-            let addr = dns.resolve(domain, port).await?;
-            (addr, host_str)
+            let addrs = dns.resolve_all(domain, port).await?;
+            (addrs, host_str)
         }
         ATYP_IPV6 => {
             let mut ip_bytes = [0u8; 16];
             client.read_exact(&mut ip_bytes).await?;
             let port = client.read_u16().await?;
             let ip = Ipv6Addr::from(ip_bytes);
-            (SocketAddr::new(IpAddr::V6(ip), port), ip.to_string())
+            (vec![SocketAddr::new(IpAddr::V6(ip), port)], ip.to_string())
         }
         other => return Err(SmokeError::UnsupportedAddressType(other)),
     };
 
-    let remote = match connect_optimized(target_addr).await {
-        Ok(stream) => stream,
+    let (remote, connected_addr) = match connect_any_optimized(&target_addrs).await {
+        Ok(res) => res,
         Err(e) => {
             let _ = client
                 .write_all(&[SOCKS_VERSION, 0x04, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
@@ -255,13 +265,24 @@ async fn handle_socks5(
     let reply = [SOCKS_VERSION, 0x00, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
     client.write_all(&reply).await?;
 
-    relay_with_desync(client, remote, target_addr, &parsed_host, engine, fixed_strategy, &[]).await
+    relay_with_desync(
+        client,
+        remote,
+        connected_addr,
+        &target_addrs,
+        &parsed_host,
+        engine,
+        fixed_strategy,
+        &[],
+    )
+    .await
 }
 
 async fn relay_with_desync(
     mut client: TcpStream,
     mut remote: TcpStream,
     target_addr: SocketAddr,
+    target_addrs: &[SocketAddr],
     host: &str,
     engine: Arc<AdaptiveEngine>,
     fixed_strategy: Option<SplitStrategy>,
@@ -310,40 +331,59 @@ async fn relay_with_desync(
         return Ok(());
     }
 
-    // Smart In-Flight Fast Failover:
-    // Если первая стратегия заблокирована ТСПУ (RST или таймаут 1200 мс),
+    // Smart In-Flight Fast Failover с проверкой подлинности TLS ServerHello (0x16) и ротацией IP:
+    // Если первая стратегия заблокирована ТСПУ (RST, таймаут или TLS Alert 0x15),
     // мы НЕ закрываем соединение клиента (Discord / браузера)!
-    // Мы на лету открываем новый сокет к серверу, берем следующую стратегию из арсенала и шлем ClientHello снова.
-    // Клиент получает ServerHello без ошибок обновления и без разрывов связи!
+    // Мы на лету открываем новый сокет к серверу, берем следующую стратегию со сдвигом attempt и шлем ClientHello снова.
     let max_attempts = 4;
     let mut current_remote = Some(remote);
+    let initial_strategy = engine.get_strategy(resolved_host);
 
     for attempt in 0..max_attempts {
-        let active_strategy = engine.get_strategy(resolved_host);
+        let active_strategy = engine.get_strategy_for_attempt(resolved_host, attempt);
+        let addr_to_try = if !target_addrs.is_empty() {
+            target_addrs[attempt % target_addrs.len()]
+        } else {
+            target_addr
+        };
+
         let mut stream = match current_remote.take() {
             Some(s) => s,
-            None => match connect_optimized(target_addr).await {
+            None => match connect_optimized(addr_to_try).await {
                 Ok(s) => s,
-                Err(e) => {
-                    debug!("Не удалось переподключиться к {}: {}", target_addr, e);
-                    return Err(SmokeError::Io(e));
-                }
+                Err(_) => match connect_any_optimized(target_addrs).await {
+                    Ok((s, _)) => s,
+                    Err(e) => {
+                        debug!("Не удалось переподключиться к {}: {}", addr_to_try, e);
+                        return Err(SmokeError::Io(e));
+                    }
+                },
             },
         };
 
         if let Err(e) = send_desync(&mut stream, slice, active_strategy).await {
             debug!("Ошибка send_desync ({:?}): {}", active_strategy, e);
-            engine.record_failure(resolved_host, active_strategy);
             continue;
         }
 
         let mut resp_first = [0u8; 1];
         match timeout(Duration::from_millis(2500), stream.read(&mut resp_first)).await {
-            Ok(Ok(n)) if n > 0 => {
+            Ok(Ok(n)) if n > 0 && resp_first[0] == 0x16 => {
+                // Подтвержден настоящий TLS ServerHello (ContentType = 0x16)!
                 engine.record_success(resolved_host, active_strategy);
                 client.write_all(&resp_first[..n]).await?;
                 let _ = tokio::io::copy_bidirectional(&mut client, &mut stream).await;
                 return Ok(());
+            }
+            Ok(Ok(n)) if n > 0 => {
+                debug!(
+                    "Получен не-ServerHello байт (0x{:02x}) на попытке {}/{} ({:?}) для {}",
+                    resp_first[0],
+                    attempt + 1,
+                    max_attempts,
+                    active_strategy,
+                    resolved_host
+                );
             }
             Ok(Ok(_)) | Err(_) => {
                 debug!(
@@ -353,20 +393,22 @@ async fn relay_with_desync(
                     active_strategy,
                     resolved_host
                 );
-                engine.record_failure(resolved_host, active_strategy);
             }
             Ok(Err(e)) => {
                 debug!(
-                    "Ошибка сокета на попытке {} ({:?}): {}",
+                    "Ошибка сокета на попытке {}/{} ({:?}): {}",
                     attempt + 1,
+                    max_attempts,
                     active_strategy,
                     e
                 );
-                engine.record_failure(resolved_host, active_strategy);
             }
         }
     }
 
+    // Если все 4 попытки внутри соединения не смогли получить валидный ServerHello,
+    // фиксируем сбой (с учетом гистерезиса для подтвержденных доменов)
+    engine.record_failure(resolved_host, initial_strategy);
     Ok(())
 }
 
@@ -375,6 +417,22 @@ fn is_private_ip(ip: IpAddr) -> bool {
         IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
         IpAddr::V6(v6) => v6.is_loopback(),
     }
+}
+
+async fn connect_any_optimized(addrs: &[SocketAddr]) -> std::io::Result<(TcpStream, SocketAddr)> {
+    let mut last_err = None;
+    for &addr in addrs {
+        match connect_optimized(addr).await {
+            Ok(stream) => return Ok((stream, addr)),
+            Err(e) => {
+                debug!("Узел {} недоступен ({}), пробуем следующий IP...", addr, e);
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "Нет доступных IP-адресов")
+    }))
 }
 
 async fn connect_optimized(addr: SocketAddr) -> std::io::Result<TcpStream> {

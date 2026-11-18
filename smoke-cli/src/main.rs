@@ -131,6 +131,10 @@ async fn main() -> Result<()> {
     // Страховка №2: перехватываем закрытие консоли крестиком [X]
     setup_console_close_handler();
 
+    // Включаем высокоточный таймер ядра Windows (1 мс вместо стандартных 15.6 мс)
+    // для мгновенной отправки фрагментов десинхронизации без задержек
+    enable_high_precision_timer();
+
     println!(
         r#"
    _____                     __          
@@ -265,3 +269,17 @@ fn setup_console_close_handler() {
 
 #[cfg(not(target_os = "windows"))]
 fn setup_console_close_handler() {}
+
+#[cfg(target_os = "windows")]
+fn enable_high_precision_timer() {
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(uPeriod: u32) -> u32;
+    }
+    unsafe {
+        timeBeginPeriod(1);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn enable_high_precision_timer() {}

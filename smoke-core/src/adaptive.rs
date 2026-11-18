@@ -90,10 +90,17 @@ impl AdaptiveEngine {
 
     /// Получает текущую лучшую стратегию для указанного домена
     pub fn get_strategy(&self, domain: &str) -> SplitStrategy {
+        self.get_strategy_for_attempt(domain, 0)
+    }
+
+    /// Получает стратегию для конкретной попытки in-flight failover (со сдвигом от текущей базовой),
+    /// позволяя тестировать следующие стратегии на лету без преждевременного сброса глобального кэша
+    pub fn get_strategy_for_attempt(&self, domain: &str, attempt: usize) -> SplitStrategy {
         let family = extract_family_domain(domain);
         let strategies = Self::get_strategies_for(domain);
         let cache = self.domain_cache.read().unwrap();
-        let idx = cache.get(&family).copied().unwrap_or(0);
+        let base_idx = cache.get(&family).copied().unwrap_or(0);
+        let idx = (base_idx + attempt) % strategies.len();
         strategies.get(idx).copied().unwrap_or(strategies[0])
     }
 
@@ -211,9 +218,14 @@ pub fn extract_family_domain(host: &str) -> String {
         return "discord_family".to_string();
     }
 
-    // Семейство Google / YouTube
+    // Видео-серверы Google Global Cache (GGC) — выделены в отдельное семейство,
+    // так как правила ТСПУ на локальных кэш-серверах провайдера часто отличаются от веб-интерфейса YouTube
+    if clean.contains("googlevideo") {
+        return "googlevideo_family".to_string();
+    }
+
+    // Веб-интерфейс и статика YouTube / Google Frontend
     if clean.contains("youtube")
-        || clean.contains("googlevideo")
         || clean.contains("ytimg")
         || clean.contains("ggpht")
         || clean == "youtu.be"
@@ -254,7 +266,7 @@ mod tests {
     #[test]
     fn test_extract_family_domain() {
         assert_eq!(extract_family_domain("www.youtube.com"), "youtube_family");
-        assert_eq!(extract_family_domain("rr1---sn-4g5edn6s.googlevideo.com:443"), "youtube_family");
+        assert_eq!(extract_family_domain("rr1---sn-4g5edn6s.googlevideo.com:443"), "googlevideo_family");
         assert_eq!(extract_family_domain("i.ytimg.com"), "youtube_family");
         assert_eq!(extract_family_domain("discord.com"), "discord_family");
         assert_eq!(extract_family_domain("gateway.discord.gg"), "discord_family");

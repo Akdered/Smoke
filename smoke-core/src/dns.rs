@@ -36,8 +36,17 @@ impl DnsResolver {
     }
 
     pub async fn resolve(&self, domain: &str, port: u16) -> Result<SocketAddr> {
+        let addrs = self.resolve_all(domain, port).await?;
+        addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| SmokeError::ResolutionFailed(domain.to_string()))
+    }
+
+    /// Возвращает список всех разрешенных IPv4-адресов (до 4 узлов) для автоматической ротации при недоступности одного из IP
+    pub async fn resolve_all(&self, domain: &str, port: u16) -> Result<Vec<SocketAddr>> {
         if let Ok(ip) = domain.parse::<IpAddr>() {
-            return Ok(SocketAddr::new(ip, port));
+            return Ok(vec![SocketAddr::new(ip, port)]);
         }
 
         // Параллельная гонка между Google DoH и Cloudflare DoH:
@@ -49,49 +58,61 @@ impl DnsResolver {
 
         let race_fut = async {
             tokio::select! {
-                res_g = Self::try_lookup(&g_res, &d1) => {
-                    if let Some(ip) = res_g {
-                        return Some(ip);
+                res_g = Self::try_lookup_all(&g_res, &d1) => {
+                    if let Some(ips) = res_g {
+                        return Some(ips);
                     }
-                    Self::try_lookup(&c_res, &d1).await
+                    Self::try_lookup_all(&c_res, &d1).await
                 }
-                res_c = Self::try_lookup(&c_res, &d2) => {
-                    if let Some(ip) = res_c {
-                        return Some(ip);
+                res_c = Self::try_lookup_all(&c_res, &d2) => {
+                    if let Some(ips) = res_c {
+                        return Some(ips);
                     }
-                    Self::try_lookup(&g_res, &d2).await
+                    Self::try_lookup_all(&g_res, &d2).await
                 }
             }
         };
 
-        if let Ok(Some(ip)) = tokio::time::timeout(Duration::from_millis(1200), race_fut).await {
-            debug!("DoH Fast-Race: {} -> {}", domain, ip);
-            return Ok(SocketAddr::new(ip, port));
+        if let Ok(Some(ips)) = tokio::time::timeout(Duration::from_millis(1200), race_fut).await {
+            debug!("DoH Fast-Race: {} -> {:?} ({} IP)", domain, ips[0], ips.len());
+            return Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect());
         }
 
         // Резерв 1: Quad9 DoH (если Google и Cloudflare одновременно недоступны)
-        if let Some(ip) = Self::try_lookup(&self.doh_quad9, domain).await {
-            debug!("Quad9 DoH: {} -> {}", domain, ip);
-            return Ok(SocketAddr::new(ip, port));
+        if let Some(ips) = Self::try_lookup_all(&self.doh_quad9, domain).await {
+            debug!("Quad9 DoH: {} -> {:?}", domain, ips[0]);
+            return Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect());
         }
 
         // Резерв 2: Системный резолвер (чтобы интернет никогда не падал)
         warn!("DoH недоступен для {}, используем системный DNS", domain);
-        let addr = lookup_host((domain, port))
+        let addrs: Vec<SocketAddr> = lookup_host((domain, port))
             .await
             .map_err(SmokeError::Io)?
-            .find(|a| a.is_ipv4())
-            .ok_or_else(|| SmokeError::ResolutionFailed(domain.to_string()))?;
+            .filter(|a| a.is_ipv4())
+            .take(4)
+            .collect();
 
-        debug!("Резервный DNS: {} -> {}", domain, addr.ip());
-        Ok(addr)
+        if addrs.is_empty() {
+            return Err(SmokeError::ResolutionFailed(domain.to_string()));
+        }
+
+        debug!("Резервный DNS: {} -> {}", domain, addrs[0].ip());
+        Ok(addrs)
     }
 
-    async fn try_lookup(resolver: &TokioAsyncResolver, domain: &str) -> Option<IpAddr> {
+    async fn try_lookup_all(resolver: &TokioAsyncResolver, domain: &str) -> Option<Vec<IpAddr>> {
         let lookup = resolver.lookup_ip(domain).await.ok()?;
-        lookup
-            .iter()
-            .find(|ip| ip.is_ipv4())
-            .or_else(|| lookup.iter().next())
+        let mut ips: Vec<IpAddr> = lookup.iter().filter(|ip| ip.is_ipv4()).take(4).collect();
+        if ips.is_empty() {
+            if let Some(first) = lookup.iter().next() {
+                ips.push(first);
+            }
+        }
+        if ips.is_empty() {
+            None
+        } else {
+            Some(ips)
+        }
     }
 }

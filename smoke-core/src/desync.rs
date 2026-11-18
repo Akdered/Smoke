@@ -131,6 +131,11 @@ pub async fn send_desync(
         }
 
         SplitStrategy::TcpSplit2 => {
+            if let Some(sni_mid) = find_sni_middle(buf) {
+                if sni_mid > 2 && sni_mid < buf.len() {
+                    return write_split_3(remote, &buf[..2], &buf[2..sni_mid], &buf[sni_mid..]).await;
+                }
+            }
             let pos = 2.min(buf.len() - 1).max(1);
             write_split_2(remote, &buf[..pos], &buf[pos..]).await
         }
@@ -181,6 +186,22 @@ pub async fn send_desync(
 
 async fn fallback_http_or_split(remote: &mut TcpStream, buf: &[u8], default_pos: usize) -> Result<()> {
     if let Some(http_pos) = find_http_host_split(buf) {
+        // Разрезаем одновременно и заголовок "Ho|st:", и середину самого домена в Host
+        let rest = &buf[http_pos..];
+        if let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") {
+            if line_end > 6 {
+                let host_mid = http_pos + 4 + (line_end - 4) / 2;
+                if host_mid > http_pos && host_mid < buf.len() {
+                    return write_split_3(
+                        remote,
+                        &buf[..http_pos],
+                        &buf[http_pos..host_mid],
+                        &buf[host_mid..],
+                    )
+                    .await;
+                }
+            }
+        }
         let (first, second) = buf.split_at(http_pos);
         return write_split_2(remote, first, second).await;
     }
@@ -204,11 +225,12 @@ fn send_stream_oob(stream: &TcpStream, byte: u8) {
     let _ = sock.send_out_of_band(&[byte]);
 }
 
-/// Легендарный трюк Disorder (ByeDPI/Zapret-style):
-/// 1-й сегмент отправляется с TTL=1 (или 2), погибает на первом роутере и не доходит до сервера.
-/// 2-й сегмент уходит с нормальным TTL и приходит на сервер ПЕРВЫМ.
-/// Сервер просит ретрансмит через SACK, и ОС досылает 1-й сегмент.
-/// Для ТСПУ порядок следования сегментов инвертирован (Part 2 -> Part 1), сборка SNI ломается!
+/// Усовершенствованный Disorder (Fast-Retransmit RFC 5681 + SNI Multi-Slicing):
+/// 1. 1-й сегмент уходит с малым TTL (1/2/3) и умирает на маршрутизаторе до ТСПУ.
+/// 2. Остаток делится на 3 отдельных сегмента (с разрезом ровно по середине и концу SNI) и уходит с нормальным TTL.
+/// 3. Получение 3 внеочередных сегментов гарантированно вызывает 3 Dup ACK (SACK) от сервера,
+///    что включает мгновенный TCP Fast Retransmit в ядре Windows за 1 RTT (~30 мс) вместо ожидания RTO (500+ мс),
+///    при этом сам домен SNI никогда не передается целым куском!
 async fn send_disorder(
     remote: &mut TcpStream,
     buf: &[u8],
@@ -222,23 +244,53 @@ async fn send_disorder(
     let (first, second) = buf.split_at(split_pos);
     let orig_ttl = get_stream_ttl(remote);
 
-    debug!("Disorder: 1-я часть ({} байт) с TTL={}, 2-я часть ({} байт)", first.len(), low_ttl, second.len());
+    debug!(
+        "Disorder (Fast-Retransmit): 1-я часть ({} байт) с TTL={}, остаток ({} байт) в 3 сегмента",
+        first.len(),
+        low_ttl,
+        second.len()
+    );
 
     // 1. Посылаем 1-ю часть с умирающим TTL
     set_stream_ttl(remote, low_ttl);
     remote.write_all(first).await?;
     remote.flush().await?;
 
-    // Пауза, чтобы пакет точно ушел с низким TTL
+    // Пауза, чтобы пакет гарантированно ушел с низким TTL отдельным IP-пакетом
     tokio::time::sleep(Duration::from_millis(1)).await;
 
-    // 2. Восстанавливаем оригинальный TTL и шлем 2-ю часть
+    // 2. Восстанавливаем оригинальный TTL
     set_stream_ttl(remote, orig_ttl);
-    remote.write_all(second).await?;
-    remote.flush().await
+
+    // 3. Делим вторую часть на 3 сегмента (разрезая SNI пополам, если он внутри second),
+    // чтобы сервер прислал ровно 3 Dup ACK и мгновенно сработал TCP Fast Retransmit!
+    if second.len() >= 6 {
+        let (p1, p2) = if let Some(sni) = find_sni_range(buf) {
+            let mid = sni.middle();
+            let end = sni.end;
+            if mid > split_pos && end > mid && end < buf.len() {
+                (mid - split_pos, end - split_pos)
+            } else {
+                (1, 2)
+            }
+        } else {
+            (1, 2)
+        };
+
+        let p1 = p1.clamp(1, second.len() - 2);
+        let p2 = p2.clamp(p1 + 1, second.len() - 1);
+
+        let s1 = &second[..p1];
+        let s2 = &second[p1..p2];
+        let s3 = &second[p2..];
+        write_split_3(remote, s1, s2, s3).await
+    } else {
+        remote.write_all(second).await?;
+        remote.flush().await
+    }
 }
 
-/// Инъекция Out-of-Band байта (TCP Urgent Pointer):
+/// Инъекция Out-of-Band байта (TCP Urgent Pointer) + дополнительный сплит хвоста SNI:
 /// Посылается 1 OOB-байт между половинами SNI. ТСПУ включает его в сигнатуру и не узнает домен,
 /// а веб-сервер игнорирует OOB-данные, сохраняя чистоту TLS-потока.
 async fn send_oob_at_sni(remote: &mut TcpStream, buf: &[u8]) -> Result<()> {
@@ -252,7 +304,7 @@ async fn send_oob_at_sni(remote: &mut TcpStream, buf: &[u8]) -> Result<()> {
     remote.write_all(first).await?;
     remote.flush().await?;
 
-    // Отправляем OOB байт
+    // Отправляем OOB байт с флагом MSG_OOB (Urgent Pointer)
     send_stream_oob(remote, b'a');
     tokio::time::sleep(Duration::from_millis(1)).await;
 
@@ -260,7 +312,9 @@ async fn send_oob_at_sni(remote: &mut TcpStream, buf: &[u8]) -> Result<()> {
     remote.flush().await
 }
 
-/// Комбо-метод: двухзвенный TLS Record + TCP Disorder на 1-м рекорде
+/// Ультимативный Комбо-метод:
+/// Мульти-рекордная TLS-фрагментация (с внедрением 5-байтного TLS-заголовка прямо в середину SNI)
+/// + TCP Disorder на 1-м рекорде + 3-сегментный Fast Retransmit!
 async fn send_combo(remote: &mut TcpStream, buf: &[u8]) -> Result<()> {
     if is_tls_handshake(buf) && buf.len() > 6 {
         let content_type = buf[0];
@@ -268,41 +322,68 @@ async fn send_combo(remote: &mut TcpStream, buf: &[u8]) -> Result<()> {
         let version_lo = buf[2];
         let handshake_payload = &buf[5..];
 
-        let frag1 = &handshake_payload[..1];
-        let frag2 = &handshake_payload[1..];
+        let split_points = compute_record_split_points(buf, handshake_payload.len());
+        let mut records: Vec<Vec<u8>> = Vec::new();
+        let mut start = 0;
 
-        let mut rec1 = Vec::with_capacity(6);
-        rec1.push(content_type);
-        rec1.push(version_hi);
-        rec1.push(version_lo);
-        rec1.extend_from_slice(&1u16.to_be_bytes());
-        rec1.extend_from_slice(frag1);
+        for &split in &split_points {
+            let end = split.min(handshake_payload.len());
+            if end <= start {
+                continue;
+            }
+            let frag = &handshake_payload[start..end];
+            let mut rec = Vec::with_capacity(5 + frag.len());
+            rec.push(content_type);
+            rec.push(version_hi);
+            rec.push(version_lo);
+            rec.extend_from_slice(&(frag.len() as u16).to_be_bytes());
+            rec.extend_from_slice(frag);
+            records.push(rec);
+            start = end;
+        }
 
-        let mut rec2 = Vec::with_capacity(5 + frag2.len());
-        rec2.push(content_type);
-        rec2.push(version_hi);
-        rec2.push(version_lo);
-        rec2.extend_from_slice(&(frag2.len() as u16).to_be_bytes());
-        rec2.extend_from_slice(frag2);
+        if start < handshake_payload.len() {
+            let frag = &handshake_payload[start..];
+            let mut rec = Vec::with_capacity(5 + frag.len());
+            rec.push(content_type);
+            rec.push(version_hi);
+            rec.push(version_lo);
+            rec.extend_from_slice(&(frag.len() as u16).to_be_bytes());
+            rec.extend_from_slice(frag);
+            records.push(rec);
+        }
 
-        let orig_ttl = get_stream_ttl(remote);
+        if records.len() >= 2 {
+            let orig_ttl = get_stream_ttl(remote);
+            debug!(
+                "Combo: {} TLS-рекордов (разрез внутри SNI) + Disorder TTL=1",
+                records.len()
+            );
 
-        debug!("Combo: Record 1 с TTL=1, Record 2 с нормальным TTL");
+            // 1-й TLS-рекорд отправляем с TTL=1
+            set_stream_ttl(remote, 1);
+            remote.write_all(&records[0]).await?;
+            remote.flush().await?;
+            tokio::time::sleep(Duration::from_millis(1)).await;
 
-        set_stream_ttl(remote, 1);
-        remote.write_all(&rec1).await?;
-        remote.flush().await?;
-        tokio::time::sleep(Duration::from_millis(1)).await;
-
-        set_stream_ttl(remote, orig_ttl);
-        remote.write_all(&rec2).await?;
-        remote.flush().await
-    } else {
-        write_split_2(remote, &buf[..1], &buf[1..]).await
+            // Остальные TLS-рекорды (с разрезанным SNI) отправляем с нормальным TTL отдельными сегментами
+            set_stream_ttl(remote, orig_ttl);
+            for (i, rec) in records[1..].iter().enumerate() {
+                remote.write_all(rec).await?;
+                remote.flush().await?;
+                if i + 2 < records.len() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+            return Ok(());
+        }
     }
+    write_split_2(remote, &buf[..1], &buf[1..]).await
 }
 
-/// Фрагментация рекордов ровно перед началом SNI
+/// Разноуровневая (Cross-Layer) фрагментация TLS-рекорда ровно посередине SNI + смещенный TCP-сплит:
+/// Внедряет 5-байтный заголовок второго TLS-рекорда [0x16, 0x03, 0x01, len_hi, len_lo] прямо внутрь имени домена
+/// (например, "www.you" + [TLS Header] + "tube.com"), а границу TCP-сегментов делает со смещением!
 async fn send_tls_record_frag_sni(remote: &mut TcpStream, buf: &[u8]) -> Result<()> {
     if buf.len() < 6 {
         return remote.write_all(buf).await;
@@ -313,7 +394,9 @@ async fn send_tls_record_frag_sni(remote: &mut TcpStream, buf: &[u8]) -> Result<
     let handshake_payload = &buf[5..];
 
     if let Some(sni_info) = find_sni_range(buf) {
-        let split_in_payload = sni_info.start.saturating_sub(5);
+        // Режем TLS Record прямо по центру имени домена SNI (а не перед ним),
+        // чтобы ни в одном TLS-рекорде и ни в одном пакете не было целой строки домена!
+        let split_in_payload = sni_info.middle().saturating_sub(5);
         if split_in_payload > 0 && split_in_payload < handshake_payload.len() {
             let frag1 = &handshake_payload[..split_in_payload];
             let frag2 = &handshake_payload[split_in_payload..];
@@ -332,7 +415,31 @@ async fn send_tls_record_frag_sni(remote: &mut TcpStream, buf: &[u8]) -> Result<
             rec2.extend_from_slice(&(frag2.len() as u16).to_be_bytes());
             rec2.extend_from_slice(frag2);
 
-            debug!("TLS Record Frag SNI: до SNI ({} байт) + с SNI ({} байт)", rec1.len(), rec2.len());
+            // Склеиваем оба TLS-рекорда и режем TCP-поток со смещением относительно границ TLS-рекордов
+            // (TCP-разрез на 2-м байте и на 2-м байте заголовка второго TLS-рекорда)
+            let mut combined = Vec::with_capacity(rec1.len() + rec2.len());
+            combined.extend_from_slice(&rec1);
+            combined.extend_from_slice(&rec2);
+
+            let tcp_split_1 = 2.min(combined.len() - 2);
+            let tcp_split_2 = (rec1.len() + 2).min(combined.len() - 1);
+
+            debug!(
+                "Cross-Layer TLS Record Frag SNI: TLS split @ {}, TCP splits @ [{}, {}]",
+                rec1.len(),
+                tcp_split_1,
+                tcp_split_2
+            );
+
+            if tcp_split_1 < tcp_split_2 && tcp_split_2 < combined.len() {
+                return write_split_3(
+                    remote,
+                    &combined[..tcp_split_1],
+                    &combined[tcp_split_1..tcp_split_2],
+                    &combined[tcp_split_2..],
+                )
+                .await;
+            }
 
             remote.write_all(&rec1).await?;
             remote.flush().await?;
@@ -437,7 +544,15 @@ async fn send_tls_record_frag_2(remote: &mut TcpStream, buf: &[u8]) -> Result<()
     rec2.extend_from_slice(&(frag2.len() as u16).to_be_bytes());
     rec2.extend_from_slice(frag2);
 
-    debug!("TLS Record Frag2: Rec 1 (6 байт) + Rec 2 ({} байт)", rec2.len());
+    debug!("TLS Record Frag2: Rec 1 (6 байт) + Rec 2 ({} байт) со сплитом SNI", rec2.len());
+
+    if let Some(sni_mid) = find_sni_middle(buf) {
+        // В rec2 позиция sni_mid смещена на +4 байта (т.к. 1 байт ушел в rec1, но добавился 5-байтный заголовок rec2)
+        let rec2_sni_mid = (sni_mid.saturating_sub(6)) + 5;
+        if rec2_sni_mid > 5 && rec2_sni_mid < rec2.len() {
+            return write_split_3(remote, &rec1, &rec2[..rec2_sni_mid], &rec2[rec2_sni_mid..]).await;
+        }
+    }
 
     remote.write_all(&rec1).await?;
     remote.flush().await?;
