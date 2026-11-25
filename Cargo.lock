@@ -893,10 +893,12 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 
 [[package]]
 name = "smoke-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde",
+ "serde_json",
  "smoke-core",
  "tokio",
  "tracing",
@@ -906,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "smoke-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "hickory-resolver",

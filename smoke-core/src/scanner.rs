@@ -35,14 +35,16 @@ pub async fn auto_select_strategy(dns: &DnsResolver) -> SplitStrategy {
     // Порядок кандидатов: от самого агрессивного к простому.
     // FakeTtl ИСКЛЮЧЕНА — она ломает TCP-поток (retransmit доставляет фейк серверу).
     let candidates = [
-        ("TlsRecordFrag", SplitStrategy::TlsRecordFrag),
+        ("TlsRecMicroSni", SplitStrategy::TlsRecMicroSni),
         ("TlsRecordFrag2", SplitStrategy::TlsRecordFrag2),
-        ("Disorder1", SplitStrategy::Disorder1),
-        ("TcpSplitSni", SplitStrategy::TcpSplitSni),
-        ("OobSni", SplitStrategy::OobSni),
+        ("TlsRecOobSni", SplitStrategy::TlsRecOobSni),
+        ("FakeTls4", SplitStrategy::FakeTls4),
+        ("FakeTls6", SplitStrategy::FakeTls6),
         ("TlsRecordFragSni", SplitStrategy::TlsRecordFragSni),
-        ("Combo", SplitStrategy::Combo),
-        ("TcpSplit2", SplitStrategy::TcpSplit2),
+        ("OobSni", SplitStrategy::OobSni),
+        ("TcpSplitSni", SplitStrategy::TcpSplitSni),
+        ("Disorder3", SplitStrategy::Disorder3),
+        ("Disorder2", SplitStrategy::Disorder2),
     ];
 
     let client_hello = build_test_client_hello(test_domain);

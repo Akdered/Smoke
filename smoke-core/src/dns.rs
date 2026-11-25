@@ -1,3 +1,4 @@
+use crate::adaptive::is_fast_direct_domain;
 use crate::error::{Result, SmokeError};
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::TokioAsyncResolver;
@@ -17,15 +18,15 @@ pub struct DnsResolver {
 impl DnsResolver {
     pub fn new_doh() -> Self {
         let mut opts = ResolverOpts::default();
-        opts.cache_size = 4096;
+        opts.cache_size = 8192;
         opts.timeout = Duration::from_millis(800);
         opts.attempts = 1;
         opts.use_hosts_file = true;
         opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4Only;
 
-        // Основные каналы: Google DoH и Cloudflare DoH
         let doh_google = TokioAsyncResolver::tokio(ResolverConfig::google_https(), opts.clone());
-        let doh_cloudflare = TokioAsyncResolver::tokio(ResolverConfig::cloudflare_https(), opts.clone());
+        let doh_cloudflare =
+            TokioAsyncResolver::tokio(ResolverConfig::cloudflare_https(), opts.clone());
         let doh_quad9 = TokioAsyncResolver::tokio(ResolverConfig::quad9_https(), opts);
 
         Self {
@@ -43,14 +44,24 @@ impl DnsResolver {
             .ok_or_else(|| SmokeError::ResolutionFailed(domain.to_string()))
     }
 
-    /// Возвращает список всех разрешенных IPv4-адресов (до 4 узлов) для автоматической ротации при недоступности одного из IP
+    /// Разрешает домен в список IPv4-адресов (до 4 узлов).
+    /// Для российских и локальных доменов использует мгновенный системный DNS (кэш ОС < 1 мс и локальный CDN),
+    /// а для внешних ресурсов — параллельную гонку защищенных DoH-каналов.
     pub async fn resolve_all(&self, domain: &str, port: u16) -> Result<Vec<SocketAddr>> {
         if let Ok(ip) = domain.parse::<IpAddr>() {
             return Ok(vec![SocketAddr::new(ip, port)]);
         }
 
-        // Параллельная гонка между Google DoH и Cloudflare DoH:
-        // Если провайдер замедляет или блокирует один из них — второй отвечает за считанные миллисекунды!
+        // Быстрый путь для .ru / локальных доменов без нагрузки на облачный DoH
+        if is_fast_direct_domain(domain) {
+            if let Ok(iter) = lookup_host((domain, port)).await {
+                let addrs: Vec<SocketAddr> = iter.filter(|a| a.is_ipv4()).take(4).collect();
+                if !addrs.is_empty() {
+                    return Ok(addrs);
+                }
+            }
+        }
+
         let g_res = self.doh_google.clone();
         let c_res = self.doh_cloudflare.clone();
         let d1 = domain.to_string();
@@ -73,18 +84,16 @@ impl DnsResolver {
             }
         };
 
-        if let Ok(Some(ips)) = tokio::time::timeout(Duration::from_millis(1200), race_fut).await {
+        if let Ok(Some(ips)) = tokio::time::timeout(Duration::from_millis(1100), race_fut).await {
             debug!("DoH Fast-Race: {} -> {:?} ({} IP)", domain, ips[0], ips.len());
             return Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect());
         }
 
-        // Резерв 1: Quad9 DoH (если Google и Cloudflare одновременно недоступны)
         if let Some(ips) = Self::try_lookup_all(&self.doh_quad9, domain).await {
             debug!("Quad9 DoH: {} -> {:?}", domain, ips[0]);
             return Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect());
         }
 
-        // Резерв 2: Системный резолвер (чтобы интернет никогда не падал)
         warn!("DoH недоступен для {}, используем системный DNS", domain);
         let addrs: Vec<SocketAddr> = lookup_host((domain, port))
             .await
@@ -97,7 +106,6 @@ impl DnsResolver {
             return Err(SmokeError::ResolutionFailed(domain.to_string()));
         }
 
-        debug!("Резервный DNS: {} -> {}", domain, addrs[0].ip());
         Ok(addrs)
     }
 

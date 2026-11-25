@@ -1,11 +1,11 @@
-use crate::adaptive::AdaptiveEngine;
+use crate::adaptive::{is_fast_direct_domain, AdaptiveEngine};
 use crate::desync::{find_sni_range, is_tls_handshake, send_desync, SplitStrategy};
 use crate::dns::DnsResolver;
 use crate::error::{Result, SmokeError};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -29,12 +29,12 @@ pub async fn run_server(
 
     if let Some(strat) = fixed_strategy {
         info!(
-            "Smoke универсальный прокси (SOCKS5 + HTTP) запущен на {} | Фиксированный режим: {:?}",
+            "Smoke прокси (SOCKS5 + HTTP) запущен на {} | Фиксированный режим: {:?}",
             bind_addr, strat
         );
     } else {
         info!(
-            "Smoke универсальный прокси (SOCKS5 + HTTP) запущен на {} | Режим: Smart Adaptive (автоподбор и самообучение на лету)",
+            "Smoke прокси (SOCKS5 + HTTP) запущен на {} | Smart Adaptive v0.6 (Direct-First + Anti-Flapping)",
             bind_addr
         );
     }
@@ -53,14 +53,15 @@ pub async fn run_server(
         let engine_clone = engine.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(client_stream, dns_clone, engine_clone, fixed_strategy).await {
+            if let Err(e) =
+                handle_connection(client_stream, dns_clone, engine_clone, fixed_strategy).await
+            {
                 debug!("Сессия {} завершена: {}", peer_addr, e);
             }
         });
     }
 }
 
-/// Автоматически определяет протокол (SOCKS5 или системный HTTP CONNECT Windows)
 async fn handle_connection(
     client: TcpStream,
     dns: DnsResolver,
@@ -89,7 +90,6 @@ async fn handle_http_proxy(
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 2048];
 
-    // Читаем HTTP-заголовок до пустой строки \r\n\r\n (динамически до 64 КБ)
     let header_end = loop {
         let n = client.read(&mut chunk).await?;
         if n == 0 {
@@ -115,7 +115,6 @@ async fn handle_http_proxy(
     let target = parts.next().ok_or(SmokeError::InvalidDomain)?;
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        // HTTPS туннель (например, CONNECT youtube.com:443 HTTP/1.1)
         let (host, port) = parse_host_port(target, 443)?;
         let target_addrs = dns.resolve_all(&host, port).await?;
 
@@ -144,7 +143,6 @@ async fn handle_http_proxy(
         )
         .await
     } else {
-        // Обычный незашифрованный HTTP-запрос
         let host_line = req_str
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("host:"))
@@ -155,7 +153,7 @@ async fn handle_http_proxy(
         let target_addrs = dns.resolve_all(&host, port).await?;
 
         let (mut remote, connected_addr) = connect_any_optimized(&target_addrs).await?;
-        let active_strategy = if is_private_ip(connected_addr.ip()) {
+        let active_strategy = if is_private_ip(connected_addr.ip()) || is_fast_direct_domain(&host) {
             SplitStrategy::None
         } else {
             fixed_strategy.unwrap_or_else(|| engine.get_strategy(&host))
@@ -304,7 +302,6 @@ async fn relay_with_desync(
 
     let slice = &first_buf[..n];
 
-    // Извлекаем точный SNI из TLS ClientHello (если есть), чтобы знать истинный домен даже при запросах по IP
     let resolved_host = if let Some(sni_info) = find_sni_range(slice) {
         if let Some(sni_bytes) = slice.get(sni_info.start..sni_info.end) {
             std::str::from_utf8(sni_bytes).unwrap_or(host)
@@ -316,11 +313,12 @@ async fn relay_with_desync(
     };
 
     let is_private = is_private_ip(target_addr.ip());
+    let is_fast_direct = is_fast_direct_domain(resolved_host);
     let is_tls = is_tls_handshake(slice);
 
-    // Если стратегия жестко зафиксирована ключом CLI или IP локальный или не TLS:
-    if fixed_strategy.is_some() || is_private || !is_tls {
-        let active_strategy = if is_private {
+    // 1. Быстрый прямой путь для .ru / локальных IP / не-TLS трафика или жестко заданного ключа --strategy
+    if fixed_strategy.is_some() || is_private || is_fast_direct || !is_tls {
+        let active_strategy = if is_private || is_fast_direct {
             SplitStrategy::None
         } else {
             fixed_strategy.unwrap_or_else(|| engine.get_strategy(resolved_host))
@@ -331,16 +329,29 @@ async fn relay_with_desync(
         return Ok(());
     }
 
-    // Smart In-Flight Fast Failover с проверкой подлинности TLS ServerHello (0x16) и ротацией IP:
-    // Если первая стратегия заблокирована ТСПУ (RST, таймаут или TLS Alert 0x15),
-    // мы НЕ закрываем соединение клиента (Discord / браузера)!
-    // Мы на лету открываем новый сокет к серверу, берем следующую стратегию со сдвигом attempt и шлем ClientHello снова.
-    let max_attempts = 4;
+    // 2. Интеллектуальный режим:
+    // - Если домен УЖЕ ПОДТВЕРЖДЕН и у него всего 1 IP (например, кэш-сервер rr1---sn-*.googlevideo.com),
+    //   делаем ровно 1 попытку (1400 мс)! Если кэш-сервер GGC мертв — быстро закрываем сокет за 1.4 сек,
+    //   чтобы плеер YouTube / YouTube Music мгновенно переключился на живой rr2 без 10-секундных зависаний!
+    // - Если домен еще НЕ подтвержден — тестируем до 5 стратегий подряд внутри одного соединения!
+    let domain_confirmed = engine.is_confirmed(resolved_host);
+    let max_attempts = if domain_confirmed {
+        if target_addrs.len() > 1 { 2 } else { 1 }
+    } else {
+        5
+    };
+
     let mut current_remote = Some(remote);
     let initial_strategy = engine.get_strategy(resolved_host);
 
     for attempt in 0..max_attempts {
-        let active_strategy = engine.get_strategy_for_attempt(resolved_host, attempt);
+        let active_strategy = if domain_confirmed {
+            // На подтвержденном домене при ротации запасного IP сохраняем проверенную стратегию
+            initial_strategy
+        } else {
+            engine.get_strategy_for_attempt(resolved_host, attempt)
+        };
+
         let addr_to_try = if !target_addrs.is_empty() {
             target_addrs[attempt % target_addrs.len()]
         } else {
@@ -366,18 +377,69 @@ async fn relay_with_desync(
             continue;
         }
 
+        // Для холостой проверки None ждем максимум 650 мс; для подтвержденных узлов — 1400 мс; при поиске — 1700 мс
+        let wait_ms = if active_strategy == SplitStrategy::None && !domain_confirmed {
+            650
+        } else if domain_confirmed {
+            1400
+        } else {
+            1700
+        };
+
         let mut resp_first = [0u8; 1];
-        match timeout(Duration::from_millis(2500), stream.read(&mut resp_first)).await {
+        match timeout(Duration::from_millis(wait_ms), stream.read(&mut resp_first)).await {
             Ok(Ok(n)) if n > 0 && resp_first[0] == 0x16 => {
-                // Подтвержден настоящий TLS ServerHello (ContentType = 0x16)!
+                // Подтвержден настоящий TLS ServerHello (ContentType = 0x16) — сразу фиксируем успех для параллельных потоков!
                 engine.record_success(resolved_host, active_strategy);
+                let handshake_at = Instant::now();
                 client.write_all(&resp_first[..n]).await?;
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut stream).await;
+
+                let (mut cr, mut cw) = client.split();
+                let (mut sr, mut sw) = stream.split();
+
+                let c2s = tokio::io::copy(&mut cr, &mut sw);
+                let s2c = async {
+                    let mut total_s2c: u64 = n as u64;
+                    let mut buf = [0u8; 16384];
+                    loop {
+                        match sr.read(&mut buf).await {
+                            Ok(0) => return Ok(total_s2c),
+                            Ok(read_n) => {
+                                total_s2c += read_n as u64;
+                                if cw.write_all(&buf[..read_n]).await.is_err() {
+                                    // Клиент (браузер/curl) сам закрыл вкладку или запрос — это НЕ блок ТСПУ!
+                                    return Ok(total_s2c);
+                                }
+                            }
+                            Err(e) => return Err((e, total_s2c)),
+                        }
+                    }
+                };
+
+                tokio::select! {
+                    _ = c2s => {}
+                    res = s2c => {
+                        if let Err((e, bytes_from_server)) = res {
+                            // Истинный 16KB-блок ТСПУ: именно УДАЛЕННАЯ сторона прислала TCP RST до 24 КБ в первые 3.5 сек!
+                            let is_remote_dpi_rst = bytes_from_server < 24_576
+                                && handshake_at.elapsed() < Duration::from_millis(3500)
+                                && matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::ConnectionAborted
+                                );
+
+                            if is_remote_dpi_rst && active_strategy == SplitStrategy::None {
+                                engine.record_post_handshake_freeze(resolved_host, active_strategy);
+                            }
+                        }
+                    }
+                }
                 return Ok(());
             }
             Ok(Ok(n)) if n > 0 => {
                 debug!(
-                    "Получен не-ServerHello байт (0x{:02x}) на попытке {}/{} ({:?}) для {}",
+                    "Отклонен не-ServerHello ответ (0x{:02x}) на попытке {}/{} ({:?}) для {}",
                     resp_first[0],
                     attempt + 1,
                     max_attempts,
@@ -387,7 +449,7 @@ async fn relay_with_desync(
             }
             Ok(Ok(_)) | Err(_) => {
                 debug!(
-                    "Попытка {}/{} ({:?}) заблокирована ТСПУ для {}",
+                    "Таймаут/EOF на попытке {}/{} ({:?}) для {}",
                     attempt + 1,
                     max_attempts,
                     active_strategy,
@@ -396,18 +458,17 @@ async fn relay_with_desync(
             }
             Ok(Err(e)) => {
                 debug!(
-                    "Ошибка сокета на попытке {}/{} ({:?}): {}",
+                    "Сброс сокета на попытке {}/{} ({:?}) для {}: {}",
                     attempt + 1,
                     max_attempts,
                     active_strategy,
+                    resolved_host,
                     e
                 );
             }
         }
     }
 
-    // Если все 4 попытки внутри соединения не смогли получить валидный ServerHello,
-    // фиксируем сбой (с учетом гистерезиса для подтвержденных доменов)
     engine.record_failure(resolved_host, initial_strategy);
     Ok(())
 }
@@ -452,8 +513,8 @@ async fn connect_optimized(addr: SocketAddr) -> std::io::Result<TcpStream> {
     let std_stream: std::net::TcpStream = socket.into();
     let tokio_stream = TcpStream::from_std(std_stream)?;
 
-    // Ограничиваем ожидание соединения 3 секундами для быстрого сброса мёртвых IP
-    match timeout(Duration::from_millis(3000), tokio_stream.writable()).await {
+    // Быстрый 2-секундный таймаут на TCP SYN, чтобы мгновенно переходить к следующему IP при blackhole
+    match timeout(Duration::from_millis(2000), tokio_stream.writable()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => {

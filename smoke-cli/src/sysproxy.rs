@@ -1,101 +1,88 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use tracing::{info, warn};
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
 
 const SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-const DEFAULT_BYPASS: &str = "localhost;127.*;10.*;192.168.*;172.16.*;<local>";
 
-const BROWSER_POLICY_KEYS: &[&str] = &[
-    r"Software\Policies\Google\Chrome",
-    r"Software\Policies\Microsoft\Edge",
-    r"Software\Policies\Yandex\YandexBrowser",
-    r"Software\Policies\BraveSoftware\Brave",
-];
+/// Обход системного прокси на уровне ОС для локальных сетей, российских доменов и игровых CDN:
+/// WinINet, Браузеры, Electron и Rust reqwest пускают их напрямую с нулевой задержкой.
+const DEFAULT_BYPASS: &str = "localhost;127.*;10.*;192.168.*;172.16.*;*.ru;*.su;*.xn--p1ai;*.by;*.kz;vk.com;*.vk.com;*.userapi.com;*.vkuser.net;*.yandex.net;*.yastatic.net;*.steamcontent.com;<local>";
+
+#[derive(Serialize, Deserialize, Default)]
+struct ProxyBackup {
+    enable: Option<u32>,
+    server: Option<String>,
+    override_list: Option<String>,
+}
 
 pub struct ProxyGuard {
     active: bool,
-    original_enable: Option<u32>,
-    original_server: Option<String>,
-    original_override: Option<String>,
-    original_quic: Vec<(&'static str, Option<u32>)>,
 }
 
 impl ProxyGuard {
-    /// Включает системный прокси Windows через нативный Win32 API реестра,
-    /// а также отключает UDP QUIC (HTTP/3) в Chromium-браузерах, принуждая YouTube к стабильному 4K TCP.
-    /// Сохраняет исходные настройки пользователя и гарантированно восстанавливает их (RAII).
-    pub fn enable(proxy_addr: &str, block_quic: bool) -> Result<Self> {
+    /// Включает системный прокси Windows, сохраняет резервную копию исходных настроек на диск
+    /// и запускает фонового сторожа (`--watchdog`), который гарантированно очистит реестр даже при убийстве процесса через Диспетчер задач!
+    pub fn enable(proxy_addr: &str) -> Result<Self> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
 
-        // 1. Считываем и сохраняем исходное состояние сети пользователя
-        let (original_enable, original_server, original_override) = match hkcu.open_subkey_with_flags(SUBKEY, KEY_READ) {
-            Ok(key) => {
-                let enable = key.get_value("ProxyEnable").ok();
-                let server = key.get_value("ProxyServer").ok();
-                let override_list = key.get_value("ProxyOverride").ok();
-                (enable, server, override_list)
-            }
-            Err(e) => {
-                warn!("Не удалось прочитать исходные настройки прокси: {}", e);
-                (None, None, None)
-            }
-        };
+        // Сохраняем исходные настройки ТОЛЬКО если нет невосстановленного бэкапа от аварийного падения
+        // и текущий ProxyServer не указывает на наш же локальный порт!
+        if get_backup_path().map_or(true, |p| !p.exists()) {
+            let backup = match hkcu.open_subkey_with_flags(SUBKEY, KEY_READ) {
+                Ok(key) => {
+                    let enable: Option<u32> = key.get_value("ProxyEnable").ok();
+                    let server: Option<String> = key.get_value("ProxyServer").ok();
+                    let override_list: Option<String> = key.get_value("ProxyOverride").ok();
 
-        // 2. Записываем настройки нашего локального прокси
+                    // Защита от самозацикливания: если в реестре остался наш же адрес 127.0.0.1:1080 — считаем исходным чистую сеть
+                    let is_our_leftover = server
+                        .as_deref()
+                        .map(|s| s.contains(proxy_addr) || s.contains("127.0.0.1:1080"))
+                        .unwrap_or(false);
+
+                    if is_our_leftover {
+                        ProxyBackup {
+                            enable: Some(0),
+                            server: None,
+                            override_list: None,
+                        }
+                    } else {
+                        ProxyBackup {
+                            enable,
+                            server,
+                            override_list,
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Не удалось прочитать исходные настройки прокси: {}", e);
+                    ProxyBackup::default()
+                }
+            };
+            save_backup(&backup);
+        }
+
         let (key, _) = hkcu.create_subkey_with_flags(SUBKEY, KEY_WRITE)?;
         key.set_value("ProxyServer", &proxy_addr)?;
         key.set_value("ProxyOverride", &DEFAULT_BYPASS)?;
         key.set_value("ProxyEnable", &1u32)?;
 
-        // 3. Блокируем проблемный UDP QUIC (Chrome, Edge, Yandex) без необходимости прав админа
-        let original_quic = if block_quic {
-            enable_quic_block()
-        } else {
-            Vec::new()
-        };
-
         notify_windows_inet();
-        info!("Системный прокси Windows активирован -> {}", proxy_addr);
+        spawn_cleanup_watchdog();
 
-        Ok(Self {
-            active: true,
-            original_enable,
-            original_server,
-            original_override,
-            original_quic,
-        })
+        info!("Системный прокси Windows активирован -> {} (с защитой Watchdog)", proxy_addr);
+
+        Ok(Self { active: true })
     }
 
     pub fn disable(&mut self) {
         if self.active {
-            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-            if let Ok((key, _)) = hkcu.create_subkey_with_flags(SUBKEY, KEY_WRITE) {
-                // Восстанавливаем ProxyEnable
-                let orig_enable = self.original_enable.unwrap_or(0);
-                let _ = key.set_value("ProxyEnable", &orig_enable);
-
-                // Восстанавливаем ProxyServer
-                if let Some(ref server) = self.original_server {
-                    let _ = key.set_value("ProxyServer", server);
-                } else {
-                    let _ = key.delete_value("ProxyServer");
-                }
-
-                // Восстанавливаем ProxyOverride
-                if let Some(ref override_list) = self.original_override {
-                    let _ = key.set_value("ProxyOverride", override_list);
-                } else {
-                    let _ = key.delete_value("ProxyOverride");
-                }
-            }
-
-            // Восстанавливаем исходные политики браузеров
-            restore_quic_block(&self.original_quic);
-
-            notify_windows_inet();
+            restore_or_clean();
             self.active = false;
-            info!("Системный прокси Windows отключен. Исходные настройки сети восстановлены.");
+            info!("Системный прокси Windows отключен. Исходные настройки сети полностью восстановлены.");
         }
     }
 }
@@ -106,56 +93,116 @@ impl Drop for ProxyGuard {
     }
 }
 
-fn enable_quic_block() -> Vec<(&'static str, Option<u32>)> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let mut original = Vec::new();
+/// Полное восстановление исходных настроек реестра (или идеальная зачистка).
+/// Вызывается при штатном выходе, закрытии крестиком [X], панике, `--clean` и из процесса-сторожа `--watchdog`.
+pub fn restore_or_clean() {
+    let backup = load_backup().unwrap_or(ProxyBackup {
+        enable: Some(0),
+        server: None,
+        override_list: None,
+    });
 
-    for &subkey in BROWSER_POLICY_KEYS {
-        let orig = hkcu.open_subkey_with_flags(subkey, KEY_READ)
-            .ok()
-            .and_then(|k| k.get_value::<u32, _>("QuicAllowed").ok());
-        original.push((subkey, orig));
-
-        if let Ok((key, _)) = hkcu.create_subkey_with_flags(subkey, KEY_WRITE) {
-            let _ = key.set_value("QuicAllowed", &0u32);
-        }
-    }
-
-    info!("✓ Блокировка QUIC (HTTP/3 UDP) активирована для Chrome, Edge, Yandex (YouTube переключен на стабильный TCP)");
-    original
-}
-
-fn restore_quic_block(original: &[(&'static str, Option<u32>)]) {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    for &(subkey, orig_val) in original {
-        if let Ok((key, _)) = hkcu.create_subkey_with_flags(subkey, KEY_WRITE) {
-            if let Some(val) = orig_val {
-                let _ = key.set_value("QuicAllowed", &val);
-            } else {
-                let _ = key.delete_value("QuicAllowed");
-            }
-        }
-    }
-}
-
-/// Аварийное отключение прокси и сброс политик (используется в panic hook и close handler)
-pub fn disable_raw() {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     if let Ok((key, _)) = hkcu.create_subkey_with_flags(SUBKEY, KEY_WRITE) {
-        let _ = key.set_value("ProxyEnable", &0u32);
-    }
+        let orig_enable = backup.enable.unwrap_or(0);
+        let _ = key.set_value("ProxyEnable", &orig_enable);
 
-    // Чистим политики браузеров при аварийном выходе
-    for &subkey in BROWSER_POLICY_KEYS {
-        if let Ok((key, _)) = hkcu.create_subkey_with_flags(subkey, KEY_WRITE) {
-            let _ = key.delete_value("QuicAllowed");
+        if let Some(ref server) = backup.server {
+            let _ = key.set_value("ProxyServer", server);
+        } else {
+            let _ = key.delete_value("ProxyServer");
+        }
+
+        if let Some(ref override_list) = backup.override_list {
+            let _ = key.set_value("ProxyOverride", override_list);
+        } else {
+            let _ = key.delete_value("ProxyOverride");
         }
     }
 
+    delete_backup();
     notify_windows_inet();
 }
 
-/// Уведомляет браузеры (Chrome, Edge, Яндекс), чтобы они подхватили настройки мгновенно
+fn get_backup_path() -> Option<PathBuf> {
+    if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+        let dir = PathBuf::from(local_appdata).join("Smoke");
+        let _ = std::fs::create_dir_all(&dir);
+        Some(dir.join("proxy_backup.json"))
+    } else {
+        None
+    }
+}
+
+fn save_backup(backup: &ProxyBackup) {
+    if let Some(path) = get_backup_path() {
+        if let Ok(json) = serde_json::to_string_pretty(backup) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+fn load_backup() -> Option<ProxyBackup> {
+    let path = get_backup_path()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn delete_backup() {
+    if let Some(path) = get_backup_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Запускает легковесный скрытый процесс-сторож (`0% CPU`), который ждет в ядре завершения основного `smoke.exe`
+/// и гарантированно чистит системный прокси даже после `Диспетчер задач -> Снять задачу` (`TerminateProcess`).
+#[cfg(target_os = "windows")]
+fn spawn_cleanup_watchdog() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    if let Ok(exe) = std::env::current_exe() {
+        let pid_str = std::process::id().to_string();
+        let _ = std::process::Command::new(exe)
+            .args(["--watchdog", &pid_str])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_cleanup_watchdog() {}
+
+/// Блокируется в ядре ОС с 0% потребления CPU до тех пор, пока родительский процесс `parent_pid` не завершится,
+/// после чего мгновенно восстанавливает сетевые настройки Windows и завершается сам.
+#[cfg(target_os = "windows")]
+pub fn run_watchdog_for_pid(parent_pid: u32) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut core::ffi::c_void;
+        fn WaitForSingleObject(hHandle: *mut core::ffi::c_void, dwMilliseconds: u32) -> u32;
+        fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
+    }
+
+    const SYNCHRONIZE: u32 = 0x00100000;
+    const INFINITE: u32 = 0xFFFFFFFF;
+
+    unsafe {
+        let handle = OpenProcess(SYNCHRONIZE, 0, parent_pid);
+        if !handle.is_null() {
+            WaitForSingleObject(handle, INFINITE);
+            CloseHandle(handle);
+        }
+    }
+
+    restore_or_clean();
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn run_watchdog_for_pid(_parent_pid: u32) {
+    restore_or_clean();
+}
+
 #[cfg(target_os = "windows")]
 fn notify_windows_inet() {
     #[link(name = "wininet")]
